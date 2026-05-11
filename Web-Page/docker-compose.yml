@@ -1,0 +1,56 @@
+version: '3.9'
+
+services:
+  # ────────────────────────────── MariaDB ──────────────────────────────
+  mariadb:
+    image: mariadb:11
+    container_name: garden_db
+    restart: unless-stopped
+    environment:
+      TZ: Asia/Jayapura
+      MYSQL_ROOT_PASSWORD: garden_root_2026!
+      MYSQL_DATABASE: 002_garden_monitoring
+      MYSQL_USER: garden_user
+      MYSQL_PASSWORD: garden_pass_2026!
+    volumes:
+      - /mnt/Mee_Data/Docker_VE/500_web_plantation/garden_db_data:/var/lib/mysql
+      - ./init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    networks:
+      - garden_net
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ────────────────────────────── Web App ──────────────────────────────
+  webapp:
+    build: .
+    container_name: garden_web
+    restart: unless-stopped
+    ports:
+      - "9876:9876"
+    environment:
+      TZ: Asia/Jayapura
+      NODE_ENV: production
+      PORT: 9876
+      DB_HOST: mariadb
+      DB_PORT: 3306
+      DB_NAME: 002_garden_monitoring
+      DB_USER: garden_user
+      DB_PASS: garden_pass_2026!
+      MQTT_HOST: 192.168.88.88
+      MQTT_PORT: 1883
+      MQTT_TOPIC_SUB: garden/sensors
+      MQTT_TOPIC_CMD: garden/commands
+    depends_on:
+      mariadb:
+        condition: service_healthy
+    networks:
+      - garden_net
+    # extra_hosts:
+    #   - "host.docker.internal:host-gateway"
+
+networks:
+  garden_net:
+    driver: bridge
