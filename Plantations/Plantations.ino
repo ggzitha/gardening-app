@@ -314,14 +314,14 @@ void setup() {
   // NTP
   syncNTP();
 
-  // WireGuard (best-effort)
-  wgConnected = tryWireGuard();
-
   // MQTT
   mqttClient.setServer(MQTT_SERVER, MQTT_PORT);
   mqttClient.setCallback(mqttCallback);
   mqttClient.setBufferSize(1024);
   connectMQTT();
+
+  // WireGuard (best-effort) - Start AFTER MQTT to avoid routing conflicts
+  wgConnected = tryWireGuard();
 
   Serial.println(F("✅ Setup complete!"));
   acc.reset();
@@ -464,7 +464,7 @@ bool tryWireGuard() {
 // =============================================================================
 void connectMQTT() {
   if (WiFi.status() != WL_CONNECTED) return;
-  Serial.print(F("🔌 Connecting MQTT..."));
+  Serial.printf("🔌 Connecting MQTT to %s:%d...", MQTT_SERVER, MQTT_PORT);
   int attempts = 0;
   while (!mqttClient.connected() && attempts++ < 5) {
     if (mqttClient.connect(MQTT_CLIENT_ID)) {
