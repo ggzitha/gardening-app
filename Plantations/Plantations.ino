@@ -853,6 +853,7 @@ String buildJsonPayload() {
   doc["valve_open"]      = isWatering;
   doc["wifi_ssid"]       = WiFi.SSID();
   doc["wifi_rssi"]       = WiFi.RSSI();
+  doc["wifi_ip"]         = WiFi.localIP().toString();
 
   if (sensorData.stat_hdc != 2) {
     doc["env_temp"]        = round(sensorData.envTempC           * 10) / 10.0;

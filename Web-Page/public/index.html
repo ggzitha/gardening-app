@@ -61,15 +61,47 @@
 
     <!-- MAIN CONTENT -->
     <main class="main-content">
+      <!-- GLOBAL HEADER ACTIONS -->
+      <style>
+        .wifi-indicator:hover .wifi-hover-box {
+          display: block !important;
+        }
+      </style>
+      <div class="global-header-actions">
+
+
+
+        <div class="top-actions"
+          style="position: relative; top: 0; right: 0; padding: 0; background: none; box-shadow: none;">
+          <button class="action-btn" id="btn-water" onclick="cmdWater()">Water Plant</button>
+          <button class="action-btn" id="btn-sync-rtc" onclick="cmdSyncRTC()">Sync RTC</button>
+        </div>
+
+        <!-- Wi-Fi Status Indicator -->
+        <div class="wifi-indicator" id="wifi-indicator"
+          style=" cursor: help; display: flex; align-items: revert;position: relative;top: 0;left: 30%;padding: 0;background: none;box-shadow: none;">
+          <svg id="wifi-icon-svg" viewBox="0 0 24 24" width="24" height="24" fill="currentColor"
+            style="color: #64748b;">
+            <path
+              d="M12 3C7.95 3 4.21 4.34 1.2 6.6L3 9C5.5 7.12 8.62 6 12 6s6.5 1.12 9 3l1.8-2.4C19.79 4.34 16.05 3 12 3zm0 5c-2.46 0-4.71.84-6.49 2.23L7.3 12.6C8.61 11.58 10.23 11 12 11s3.39.58 4.7 1.6l1.79-2.37C16.71 8.84 14.46 8 12 8zm0 5c-1.12 0-2.16.36-2.98.97l2.98 3.97 2.98-3.97C14.16 13.36 13.12 13 12 13z" />
+          </svg>
+          <div class="wifi-hover-box"
+            style="position: absolute; right: 0; top: 30px; background: rgba(255,255,255,0.95); padding: 10px 14px; border-radius: 8px; box-shadow: 0 4px 12px rgba(0,0,0,0.15); display: none; white-space: nowrap; font-size: 0.85rem; border: 1px solid #e2e8f0; pointer-events: none; z-index: 100;">
+            <strong id="wifi-hover-ssid" style="color: #0ea5e9;">Offline</strong><br>
+            <span style="color: #64748b; margin-top: 4px; display: inline-block;">IP: <span id="wifi-hover-ip"
+                style="color:#333; font-weight:500;">--</span></span><br>
+            <span style="color: #64748b;">Signal: <span id="wifi-hover-rssi"
+                style="color:#333; font-weight:500;">--</span> dBm</span>
+          </div>
+        </div>
+
+
+      </div>
+
       <!-- DASHBOARD VIEW -->
       <section class="page active" id="page-garden">
         <div class="sky-background" id="sky-bg"></div>
         <div id="weather-layer"></div>
-
-        <div class="top-actions">
-          <button class="action-btn" id="btn-water" onclick="cmdWater()">Water Plant</button>
-          <button class="action-btn" id="btn-sync-rtc" onclick="cmdSyncRTC()">Sync RTC</button>
-        </div>
 
         <div class="garden-wrapper">
           <div class="garden-scene-box">

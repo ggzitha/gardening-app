@@ -121,18 +121,18 @@ function updateDashboard(d) {
   setText('val-battery', bLabel);
 
   // ── List View Page ──
-  setText('dv-moisture', `${num(d.soil_moisture).toFixed(1)} %`);
+  setText('dv-moisture', `${num(d.soil_moisture).toFixed(2)} %`);
   setText('dv-soil1', rawToMoistPct(d.soil1_raw));
   setText('dv-soil2', rawToMoistPct(d.soil2_raw));
   setText('dv-soil3', rawToMoistPct(d.soil3_raw));
-  setText('dv-soiltemp', `${num(d.soil_temp).toFixed(1)} °C`);
-  setText('dv-ambtemp', `${num(d.ambient_temp).toFixed(1)} °C`);
-  setText('dv-hum', `${num(d.humidity).toFixed(1)} %`);
-  setText('dv-envtemp', d.env_temp != null ? `${num(d.env_temp).toFixed(1)} °C` : '—');
-  setText('dv-envhum', d.env_hum != null ? `${num(d.env_hum).toFixed(1)} %` : '—');
-  setText('dv-inttemp', d.int_temp != null ? `${num(d.int_temp).toFixed(1)} °C` : '—');
-  setText('dv-intpres', d.int_pres != null ? `${num(d.int_pres).toFixed(1)} hPa` : '—');
-  setText('dv-soctemp', d.soc_temp != null ? `${num(d.soc_temp).toFixed(1)} °C` : '—');
+  setText('dv-soiltemp', `${num(d.soil_temp).toFixed(2)} °C`);
+  setText('dv-ambtemp', `${num(d.ambient_temp).toFixed(2)} °C`);
+  setText('dv-hum', `${num(d.humidity).toFixed(2)} %`);
+  setText('dv-envtemp', d.env_temp != null ? `${num(d.env_temp).toFixed(2)} °C` : '—');
+  setText('dv-envhum', d.env_hum != null ? `${num(d.env_hum).toFixed(2)} %` : '—');
+  setText('dv-inttemp', d.int_temp != null ? `${num(d.int_temp).toFixed(2)} °C` : '—');
+  setText('dv-intpres', d.int_pres != null ? `${num(d.int_pres).toFixed(2)} hPa` : '—');
+  setText('dv-soctemp', d.soc_temp != null ? `${num(d.soc_temp).toFixed(2)} °C` : '—');
   setText('dv-uv', num(d.uv_index).toFixed(2));
   setText('dv-rain', d.is_raining ? '🌧️ Likely/Raining' : '☀️ Dry');
   setText('dv-n', d.nitrogen != null ? `${num(d.nitrogen).toFixed(0)} ppm` : '—');
@@ -140,8 +140,8 @@ function updateDashboard(d) {
   setText('dv-k', d.potassium != null ? `${num(d.potassium).toFixed(0)} ppm` : '—');
   setText('dv-ph', d.ph != null ? num(d.ph).toFixed(2) : '—');
   setText('dv-bv', `${num(d.battery_v).toFixed(2)} V`);
-  setText('dv-ma', `${num(d.current_ma).toFixed(1)} mA`);
-  setText('dv-mw', `${num(d.power_mw).toFixed(1)} mW`);
+  setText('dv-ma', `${num(d.current_ma).toFixed(2)} mA`);
+  setText('dv-mw', `${num(d.power_mw).toFixed(2)} mW`);
   setText('val-valve', d.valve_open ? 'Open' : 'Closed');
 
   // refresh open modal gauges only (chart is debounced separately)
@@ -529,7 +529,7 @@ async function loadModalChart(type, period) {
       y: {
         display: true,
         beginAtZero: false,
-        ticks: { callback: v => Number(v).toFixed(1) }
+        ticks: { callback: v => Number(v).toFixed(2) }
       }
     },
     plugins: {
@@ -537,7 +537,7 @@ async function loadModalChart(type, period) {
       tooltip: {
         backgroundColor: 'rgba(255,255,255,0.95)', titleColor: '#333', bodyColor: '#555',
         borderColor: 'rgba(0,0,0,0.1)', borderWidth: 1,
-        callbacks: { label: ctx => ` ${ctx.dataset.label}: ${Number(ctx.parsed.y).toFixed(1)}` }
+        callbacks: { label: ctx => ` ${ctx.dataset.label}: ${Number(ctx.parsed.y).toFixed(2)}` }
       }
     }
   };
@@ -649,8 +649,13 @@ function drawGauge(canvas, value, max, unit, color) {
     ctx.lineWidth = 12; ctx.lineCap = 'round'; ctx.stroke();
   }
 
-  const precision = (unit === 'V' || unit === '' || canvas.id.includes('ph') || canvas.id.includes('uv')) ? 2 : 1;
-  const display = isNaN(value) ? '—' : `${value.toFixed(precision)}${unit}`;
+  // Use 2 decimal points globally for gauges (except NPK which is 0 decimals)
+  let display = '—';
+  if (!isNaN(value)) {
+    if (unit === 'ppm') display = `${value.toFixed(0)}${unit}`;
+    else display = `${value.toFixed(2)}${unit}`;
+  }
+  
   ctx.fillStyle = '#333'; ctx.font = `600 ${W * 0.18}px Inter, sans-serif`;
   ctx.textAlign = 'center'; ctx.textBaseline = 'middle'; ctx.fillText(display, cx, cy);
 }
@@ -693,10 +698,10 @@ async function loadHistoryPage() {
         responsive: true, maintainAspectRatio: false,
         plugins: {
           legend: { display: false },
-          tooltip: { callbacks: { label: ctx => ` ${Number(ctx.parsed.y).toFixed(1)}` } }
+          tooltip: { callbacks: { label: ctx => ` ${Number(ctx.parsed.y).toFixed(2)}` } }
         },
         scales: {
-          y: { ticks: { callback: v => Number(v).toFixed(1) } }
+          y: { ticks: { callback: v => Number(v).toFixed(2) } }
         }
       }
     });
@@ -802,6 +807,21 @@ function renderSysHealth() {
     // Inject dynamic Wi-Fi stats
     if (k === 'wifi' && status !== 'error' && latestData.wifi_ssid) {
       desc = `Connected to ${latestData.wifi_ssid} (${latestData.wifi_rssi} dBm)`;
+      
+      // Also update the global header Wi-Fi indicator!
+      const wSSID = document.getElementById('wifi-hover-ssid');
+      const wIP   = document.getElementById('wifi-hover-ip');
+      const wRSSI = document.getElementById('wifi-hover-rssi');
+      const wIcon = document.getElementById('wifi-icon-svg');
+      if (wSSID) wSSID.innerText = latestData.wifi_ssid;
+      if (wIP) wIP.innerText = latestData.wifi_ip || '--';
+      if (wRSSI) wRSSI.innerText = latestData.wifi_rssi;
+      
+      if (wIcon) {
+        if (latestData.wifi_rssi > -65) wIcon.style.color = '#22c55e'; // Green
+        else if (latestData.wifi_rssi > -85) wIcon.style.color = '#eab308'; // Yellow
+        else wIcon.style.color = '#ef4444'; // Red
+      }
     }
 
     const info = SYS_MAP[k];
