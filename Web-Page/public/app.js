@@ -57,7 +57,12 @@ function updateDashboard(d) {
   updateTimeAgo();
 
   const sysData = d.sys || (typeof d.raw_json === 'string' ? (JSON.parse(d.raw_json).sys || null) : (d.raw_json?.sys || null));
-  if (sysData) updateSystemHealth(sysData);
+  if (sysData) {
+    if (d.wifi_ssid) {
+      sysData.wifi = (d.wifi_rssi < -85) ? 'warn' : 'ok';
+    }
+    updateSystemHealth(sysData);
+  }
 
   d.soil1_pct = parseFloat(rawToMoistPct(d.soil1_raw));
   d.soil2_pct = parseFloat(rawToMoistPct(d.soil2_raw));
@@ -752,7 +757,8 @@ const SYS_MAP = {
   hdc: { name: 'HDC1080 Temp/Hum (Env1)', ok: 'Reading successfully', warn: '-', error: 'I2C Disconnected' },
   bmp: { name: 'BMP280 Enclosure (T/P)', ok: 'Reading successfully', warn: '-', error: 'I2C Disconnected' },
   ds18: { name: 'DS18B20 Soil Temp', ok: 'Reading successfully', warn: '-', error: 'Disconnected / -127' },
-  ina: { name: 'INA226 Power', ok: 'Reading successfully', warn: '-', error: 'I2C Disconnected' }
+  ina: { name: 'INA226 Power', ok: 'Reading successfully', warn: '-', error: 'I2C Disconnected' },
+  wifi: { name: 'Wi-Fi Connection', ok: 'Connected', warn: 'Weak Signal', error: 'Disconnected' }
 };
 
 function updateSystemHealth(sys) {
@@ -791,6 +797,11 @@ function renderSysHealth() {
     // Inject dynamic RTC time
     if (k === 'rtc' && status === 'ok' && currentSysStatus.rtc_time) {
       desc = `Time synchronized (${currentSysStatus.rtc_time})`;
+    }
+    
+    // Inject dynamic Wi-Fi stats
+    if (k === 'wifi' && status !== 'error' && latestData.wifi_ssid) {
+      desc = `Connected to ${latestData.wifi_ssid} (${latestData.wifi_rssi} dBm)`;
     }
 
     const info = SYS_MAP[k];

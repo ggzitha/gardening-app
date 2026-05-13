@@ -126,12 +126,14 @@ const char* WG_LOCAL_IP       = "100.90.80.28";
 const char* WG_LOCAL_NETMASK  = "255.255.255.255";
 
 // INA226 config (I2C address 0x45: A1=VS, A0=VS)
-// Shunt confirmed = 5mΩ (0.005Ω) based on working test sketch values
-// Proof: 0.962mV ÷ 192.5mA = 0.005Ω
-// NOTE: "R100" marking on the board is NOT the shunt — the shunt is the
-// tiny resistor between IN+ and IN- (usually unlabeled or marked separately)
-#define INA226_SHUNT_OHM  0.005f  // 5mΩ confirmed from test bench
-#define INA226_MAX_A      1.0f    // max expected current — matches test sketch
+// Shunt confirmed = R100 (0.1 Ohm)
+// Note: With an R100 shunt, the physical maximum measurable current before ADC clipping is ~819mA.
+#define INA226_SHUNT_OHM  0.100f  // R100 = 0.1 Ohm
+#define INA226_MAX_A      1.0f    // Changed back to 1.0f to prevent configuration failure (0.0mA bug)
+
+// Current Offset: Used if the INA226 only measures the solar input branch.
+// Subtracts the constant ESP32 load (~100-110mA) to calculate NET battery current.
+#define INA_I_OFFSET_mA  -135.0f  
 
 // ───── Global Objects ────────────────────────────────────────────────────────
 WiFiMulti     wifiMulti;
@@ -595,10 +597,12 @@ void readSensors() {
   // ── INA226 Power Monitor ──
   if (sensorData.stat_ina != 2) {
     float busV   = ina226.getBusVoltage();
-    // Negate: with Battery→IN+, Load→IN- wiring, discharge reads positive on INA226.
-    // We flip the sign so: negative = discharging, positive = charging (charger connected).
-    float currMA = -ina226.getCurrent_mA();
-    float powMW  = ina226.getPower_mW();
+    // Bypass library calibration bugs: calculate directly from Raw Shunt Voltage!
+    // I(mA) = V(mV) / R(Ohms)
+    float shuntMV = ina226.getShuntVoltage_mV();
+    // Add the manual offset to simulate net battery current (Charger Input minus ESP32 Load)
+    float currMA  = (shuntMV / INA226_SHUNT_OHM) + INA_I_OFFSET_mA;
+    float powMW   = busV * currMA; // P(mW) = V(V) * I(mA)
     acc.busVoltageV += busV;   acc.c_busVoltage++;
     acc.currentMA   += currMA; acc.c_current++;
     acc.powerMW     += powMW;  acc.c_power++;
@@ -847,6 +851,8 @@ String buildJsonPayload() {
   doc["power_mw"]        = round(sensorData.powerMW      * 10) / 10.0;
   doc["is_charging"]     = sensorData.isCharging;
   doc["valve_open"]      = isWatering;
+  doc["wifi_ssid"]       = WiFi.SSID();
+  doc["wifi_rssi"]       = WiFi.RSSI();
 
   if (sensorData.stat_hdc != 2) {
     doc["env_temp"]        = round(sensorData.envTempC           * 10) / 10.0;
