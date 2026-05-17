@@ -71,6 +71,19 @@ function initMQTT() {
   mqttClient.on('message', async (topic, payload) => {
     let data;
     try { data = JSON.parse(payload.toString()); } catch { return; }
+    
+    if (data.type === 'watering_log') {
+      try {
+        await dbPool.execute(
+          'INSERT INTO watering_logs (duration_sec, start_moist, end_moist, is_manual) VALUES (?, ?, ?, ?)',
+          [data.duration_sec, data.start_moist, data.end_moist, data.is_manual ? 1 : 0]
+        );
+        const msg = JSON.stringify({ type: 'watering_log', data });
+        wss.clients.forEach(c => { if (c.readyState === 1) c.send(msg); });
+      } catch (e) { console.error('DB log error:', e.message); }
+      return;
+    }
+
     latestData = data;
 
     // Store in DB
@@ -239,7 +252,18 @@ app.post('/api/command', async (req, res) => {
 app.post('/api/purge-db', async (req, res) => {
   try {
     await dbPool.execute('DELETE FROM sensor_readings');
+    await dbPool.execute('DELETE FROM watering_logs');
     res.json({ ok: true, message: 'Sensor data purged successfully' });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Fetch Watering Logs
+app.get('/api/watering-events', async (req, res) => {
+  try {
+    const [rows] = await dbPool.query('SELECT * FROM watering_logs ORDER BY event_at DESC LIMIT 200');
+    res.json(rows);
   } catch (e) {
     res.status(500).json({ error: e.message });
   }

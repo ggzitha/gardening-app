@@ -16,6 +16,10 @@ function connectWS() {
       if (msg.type === 'sensor_update') {
         latestData = msg.data;
         updateDashboard(msg.data);
+      } else if (msg.type === 'watering_log') {
+        if (document.getElementById('page-watering')?.classList.contains('active')) {
+          loadWateringLogs();
+        }
       }
     } catch { }
   };
@@ -208,6 +212,7 @@ function setPage(page) {
   document.getElementById(`page-${page}`)?.classList.add('active');
   document.getElementById(`nav-${page}`)?.classList.add('active');
   if (page === 'dashboard') loadHistoryPage();
+  if (page === 'watering') loadWateringLogs();
   document.querySelector('.sidebar')?.classList.remove('open');
 }
 
@@ -245,6 +250,56 @@ function showToast(message, type = 'success', durationMs = 3500) {
     el.style.opacity = '0'; el.style.transform = 'translateX(20px)';
     setTimeout(() => el.remove(), 300);
   }, durationMs);
+}
+
+// ── Watering Logs ─────────────────────────────────────────
+async function loadWateringLogs() {
+  const c = document.getElementById('watering-logs-container');
+  if (!c) return;
+  try {
+    const r = await fetch('/api/watering-events');
+    if (!r.ok) throw new Error('Failed to fetch');
+    const data = await r.json();
+    if (!data.length) {
+      c.innerHTML = '<div style="text-align:center; padding: 20px; color: var(--text-muted);">No watering logs found.</div>';
+      return;
+    }
+    
+    let html = '';
+    let lastDate = '';
+    data.forEach(log => {
+      const dt = new Date(log.event_at);
+      const dateStr = dt.toLocaleDateString(undefined, { weekday: 'short', year: 'numeric', month: 'long', day: 'numeric' });
+      if (dateStr !== lastDate) {
+        if (lastDate !== '') html += `</div></div>`;
+        html += `<div style="background: rgba(255,255,255,0.7); backdrop-filter: blur(10px); border-radius: 12px; margin-bottom: 15px; border: 1px solid #e2e8f0; overflow: hidden; box-shadow: 0 4px 6px rgba(0,0,0,0.02);">
+          <div style="background: #bae6fd; padding: 10px 15px; font-weight: 600; color: #0369a1; border-bottom: 1px solid #e2e8f0;">${dateStr}</div>
+          <div style="padding: 10px;">`;
+        lastDate = dateStr;
+      }
+      
+      const timeStr = dt.toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' });
+      const typeStr = log.is_manual ? 'Manual' : 'Auto';
+      const typeColor = log.is_manual ? '#8b5cf6' : '#10b981';
+      
+      html += `
+        <div style="display: flex; justify-content: space-between; align-items: center; padding: 12px 10px; border-bottom: 1px solid #f1f5f9;">
+          <div>
+            <strong style="font-size: 1.1rem; color: #334155;">${timeStr}</strong>
+            <span style="background: ${typeColor}15; color: ${typeColor}; padding: 3px 8px; border-radius: 20px; font-size: 0.75rem; font-weight: 600; margin-left: 8px;">${typeStr}</span>
+          </div>
+          <div style="text-align: right;">
+            <div style="color: #64748b; font-size: 0.85rem;">Duration: <strong>${log.duration_sec}s</strong></div>
+            <div style="color: #0ea5e9; font-weight: 600; font-size: 0.9rem;">${Number(log.start_moist).toFixed(1)}% ➔ ${Number(log.end_moist).toFixed(1)}%</div>
+          </div>
+        </div>
+      `;
+    });
+    html += `</div></div>`;
+    c.innerHTML = html;
+  } catch(e) {
+    c.innerHTML = `<div style="text-align:center; padding: 20px; color: #ef4444;">Error: ${e.message}</div>`;
+  }
 }
 
 // ── Watering Control ──────────────────────────────────────

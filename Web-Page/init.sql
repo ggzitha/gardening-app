@@ -56,6 +56,17 @@ CREATE TABLE IF NOT EXISTS events (
     INDEX idx_event_at (event_at)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
+-- ── Watering Logs ────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS watering_logs (
+    id            BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+    event_at      DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    duration_sec  INT UNSIGNED,
+    start_moist   FLOAT,
+    end_moist     FLOAT,
+    is_manual     TINYINT(1) DEFAULT 0,
+    INDEX idx_event_at (event_at)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
 -- ── Seed demo row (so dashboard shows something on first boot) ──
 INSERT IGNORE INTO sensor_readings
   (recorded_at, soil1_raw, soil2_raw, soil3_raw, soil_moisture,

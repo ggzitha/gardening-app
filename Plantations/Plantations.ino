@@ -19,8 +19,6 @@
 #include <ArduinoJson.h>
 #include <INA226.h>
 #include <RTClib.h>
-// WireGuard – uses WireGuard-ESP32 library (https://github.com/ciniml/WireGuard-ESP32-Arduino)
-#include <WireGuard-ESP32.h>
 
 // ───── Pin Definitions ───────────────────────────────────────────────────────
 // Soil Moisture (capacitive) – ADC1 channels (safe with WiFi)
@@ -85,11 +83,13 @@
 #define OFFSET_UV 0.0f
 
 // ───── Configuration ─────────────────────────────────────────────────────────
-// WiFi credentials (tries both)
+// WiFi credentials (tries all and picks best signal)
 const char* WIFI_SSID1     = "DCLXVI";
 const char* WIFI_PASS1     = "1029384756";
 const char* WIFI_SSID2     = "BBWV_Oprasional";
 const char* WIFI_PASS2     = "Balai5-OPRA123!";
+const char* WIFI_SSID3     = "BMKG-JAYAPURA";
+const char* WIFI_PASS3     = "bmkg@123";
 
 // NTP
 const char* NTP_SERVER     = "pool.ntp.org";
@@ -116,15 +116,6 @@ const float TEMP_HOT_THRESHOLD  = 35.0f; // °C
 // Watering
 const unsigned long WATER_MAX_MS = 60000UL; // 1 minute max
 
-// WireGuard
-const char* WG_PRIVATE_KEY    = "IHrHmcFWJ7CiEJ58Ptfg4g5luPYvy6wK6fvohog8u38=";
-const char* WG_PUBLIC_KEY     = "RmHRBgognQb7b9ft/gmNxhmnx1Q/KpFEWJCI8SlCMDg=";
-const char* WG_PRESHARED_KEY  = "j+PWGeEMaRanljKbjM6sfOiNMkDacVehl9/NqBJkzcc=";
-const char* WG_ENDPOINT_IP    = "vpn-2.balai5.my.id";
-const int   WG_ENDPOINT_PORT  = 51822;
-const char* WG_LOCAL_IP       = "100.90.80.28";
-const char* WG_LOCAL_NETMASK  = "255.255.255.255";
-
 // INA226 config (I2C address 0x45: A1=VS, A0=VS)
 // Shunt confirmed = R100 (0.1 Ohm)
 // Note: With an R100 shunt, the physical maximum measurable current before ADC clipping is ~819mA.
@@ -149,9 +140,6 @@ ClosedCube_HDC1080 hdc1080;
 INA226            ina226(0x45);
 RTC_DS3231        rtc;
 
-static WireGuard wg;
-bool wgConnected = false;
-
 // RS485 Serial
 HardwareSerial rs485Serial(2);  // UART2
 
@@ -160,6 +148,8 @@ unsigned long lastPublishMs   = 0;
 unsigned long lastSampleMs    = 0;
 unsigned long wateringStartMs = 0;
 bool          isWatering      = false;
+float         wateringStartMoisture = 0.0f;
+bool          manualWateringActive = false;
 
 struct SensorData {
   // Soil moisture (raw ADC, average of 3 sensors)
@@ -235,11 +225,10 @@ void readSensors();
 void readNPKandPH();
 void publishData();
 void checkAutoWatering();
-void controlValve(bool open);
+void controlValve(bool open, bool isManual = false);
 String buildJsonPayload();
 float rawToMoisturePct(int raw);
 float rawToUVIndex(int raw);
-bool  tryWireGuard();
 
 #ifdef __cplusplus
 extern "C" float temperatureRead();
@@ -322,9 +311,6 @@ void setup() {
   mqttClient.setBufferSize(1024);
   connectMQTT();
 
-  // WireGuard (best-effort) - Start AFTER MQTT to avoid routing conflicts
-  wgConnected = tryWireGuard();
-
   Serial.println(F("✅ Setup complete!"));
   acc.reset();
   // Initialize both timers to now so:
@@ -397,6 +383,7 @@ void connectWiFi() {
   Serial.println(F("📶 Connecting to WiFi..."));
   wifiMulti.addAP(WIFI_SSID1, WIFI_PASS1);
   wifiMulti.addAP(WIFI_SSID2, WIFI_PASS2);
+  wifiMulti.addAP(WIFI_SSID3, WIFI_PASS3);
 
   unsigned long t = millis();
   while (wifiMulti.run() != WL_CONNECTED) {
@@ -439,29 +426,6 @@ void syncNTP() {
 }
 
 // =============================================================================
-//  WireGuard
-// =============================================================================
-bool tryWireGuard() {
-  Serial.println(F("🔒 Starting WireGuard..."));
-  IPAddress localIP;
-  if (!localIP.fromString(WG_LOCAL_IP)) return false;
-  IPAddress gatewayIP(100, 90, 80, 1);
-  IPAddress netmask(255, 255, 255, 255);
-
-  // Note: WireGuard-ESP32 library uses static config
-  wg.begin(
-    localIP,
-    WG_PRIVATE_KEY,
-    WG_ENDPOINT_IP,
-    WG_PUBLIC_KEY,
-    WG_ENDPOINT_PORT
-  );
-  delay(2000);
-  Serial.println(F("✅ WireGuard tunnel up (best-effort)"));
-  return true;
-}
-
-// =============================================================================
 //  MQTT
 // =============================================================================
 void connectMQTT() {
@@ -491,7 +455,7 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
   if (!cmd) return;
 
   if (strcmp(cmd, "water_start") == 0) {
-    controlValve(true);
+    controlValve(true, true);
   } else if (strcmp(cmd, "water_stop") == 0) {
     controlValve(false);
   } else if (strcmp(cmd, "sync_rtc") == 0) {
@@ -535,7 +499,23 @@ void readSensors() {
   float m1 = rawToMoisturePct(sensorData.soil1Raw);
   float m2 = rawToMoisturePct(sensorData.soil2Raw);
   float m3 = rawToMoisturePct(sensorData.soil3Raw);
-  acc.soilMoistureAvgPct += (m1 + m2 + m3) / 3.0f; acc.c_soilMoisture++;
+  
+  float m[3] = {m1, m2, m3};
+  // Sort values
+  if (m[0] > m[1]) { float t = m[0]; m[0] = m[1]; m[1] = t; }
+  if (m[1] > m[2]) { float t = m[1]; m[1] = m[2]; m[2] = t; }
+  if (m[0] > m[1]) { float t = m[0]; m[0] = m[1]; m[1] = t; }
+  
+  float avg = 0;
+  if ((m[2] - m[1]) > 15.0f) {
+      avg = (m[0] + m[1]) / 2.0f; // Exclude high outlier
+  } else if ((m[1] - m[0]) > 15.0f) {
+      avg = (m[1] + m[2]) / 2.0f; // Exclude low outlier
+  } else {
+      avg = (m[0] + m[1] + m[2]) / 3.0f;
+  }
+  
+  acc.soilMoistureAvgPct += avg; acc.c_soilMoisture++;
 
   // ── DS18B20 Soil Temperature ──
   if (sensorData.stat_ds18 != 2) {
@@ -757,28 +737,41 @@ void readNPKandPH() {
 //  Auto Watering Logic
 // =============================================================================
 void checkAutoWatering() {
-  bool tooDry = (sensorData.soilMoistureAvgPct < 30.0f);
-  
-  float tSum = 0; int tCount = 0;
-  if (sensorData.stat_aht != 2) { tSum += sensorData.ambientTempC; tCount++; }
-  if (sensorData.stat_hdc != 2) { tSum += sensorData.envTempC; tCount++; }
-  float validAvgTemp = tCount > 0 ? tSum / (float)tCount : 0.0f;
-  
-  bool tooHot = (validAvgTemp > TEMP_HOT_THRESHOLD);
-  bool noRain = !sensorData.isRaining;
+  bool tooDry = (sensorData.soilMoistureAvgPct < 50.0f);
 
-  if (!isWatering && noRain && (tooDry || tooHot)) {
-    Serial.println(F("💧 Auto-watering: conditions met – opening valve"));
+  if (!isWatering && tooDry) {
+    Serial.println(F("💧 Auto-watering: soil too dry – opening valve"));
     controlValve(true);
-  } else if (isWatering && !tooDry && sensorData.soilMoistureAvgPct >= 60.0f) {
+  } else if (isWatering && sensorData.soilMoistureAvgPct >= 60.0f) {
     Serial.println(F("✅ Auto-watering: soil moist – closing valve"));
     controlValve(false);
   }
 }
 
-void controlValve(bool open) {
+void controlValve(bool open, bool isManual) {
+  if (isWatering == open) return;
   isWatering = open;
-  if (open) wateringStartMs = millis();
+  
+  if (open) {
+    wateringStartMs = millis();
+    wateringStartMoisture = sensorData.soilMoistureAvgPct;
+    manualWateringActive = isManual;
+  } else {
+    unsigned long durationSec = (millis() - wateringStartMs) / 1000;
+    float endMoist = sensorData.soilMoistureAvgPct;
+    
+    StaticJsonDocument<256> logDoc;
+    logDoc["type"] = "watering_log";
+    logDoc["duration_sec"] = durationSec;
+    logDoc["start_moist"] = round(wateringStartMoisture * 10) / 10.0;
+    logDoc["end_moist"] = round(endMoist * 10) / 10.0;
+    logDoc["is_manual"] = manualWateringActive;
+    
+    char logBuffer[256];
+    serializeJson(logDoc, logBuffer);
+    mqttClient.publish(MQTT_TOPIC_PUB, logBuffer);
+  }
+  
   digitalWrite(PIN_MOSFET_VALVE, open ? HIGH : LOW);
   Serial.printf("💧 Valve: %s\n", open ? "OPEN" : "CLOSED");
 }
