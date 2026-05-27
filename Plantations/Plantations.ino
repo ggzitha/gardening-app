@@ -8,6 +8,7 @@
 // ───── Library Includes ──────────────────────────────────────────────────────
 #include <WiFi.h>
 #include <WiFiMulti.h>
+#include <esp_wifi.h>
 #include <time.h>
 #include <Wire.h>
 #include <OneWire.h>
@@ -22,27 +23,29 @@
 
 // ───── Pin Definitions ───────────────────────────────────────────────────────
 // Soil Moisture (capacitive) – ADC1 channels (safe with WiFi)
-#define PIN_SOIL1       34   // ADC1_CH6
-#define PIN_SOIL2       35   // ADC1_CH7
-#define PIN_SOIL3       32   // ADC1_CH4
+#define PIN_SOIL1 34  // ADC1_CH6
+#define PIN_SOIL2 35  // ADC1_CH7
+#define PIN_SOIL3 32  // ADC1_CH4
 // Soil PH Sensor
-#define PIN_PH          36   // ADC1_CH0
+#define PIN_PH 36  // ADC1_CH0
 
 // UV Sensor (GUVA-S12SD)
-#define PIN_UV          33   // ADC1_CH5
+#define PIN_UV 33  // ADC1_CH5
 
 // PIN 39 was Raindrop Sensor (REMOVED)
 
 // DS18B20 Soil Temperature
-#define PIN_DS18B20     4    // 1-Wire data
+#define PIN_DS18B20 4  // 1-Wire data
 
 // MOSFET Gates
 #define PIN_MOSFET_VALVE 26  // Controls solenoid water valve
+#define PIN_MOSFET_3V3 25    // Controls 3.3V sensors power (AHT10, etc)
+#define PIN_MOSFET_5V 27     // Controls 5V sensors power (NPK RS485)
 
 // RS485 for NPK Sensor
-#define PIN_RS485_RO    16   // Connect to RO (Receiver Output) on MAX485
-#define PIN_RS485_DI    17   // Connect to DI (Data In) on MAX485
-#define PIN_RS485_DE_RE 5    // Connect to both DE and RE pins (Drive Enable)
+#define PIN_RS485_RO 16    // Connect to RO (Receiver Output) on MAX485
+#define PIN_RS485_DI 17    // Connect to DI (Data In) on MAX485
+#define PIN_RS485_DE_RE 5  // Connect to both DE and RE pins (Drive Enable)
 
 // I2C (SDA=21, SCL=22 default) → AHT10 + INA226 + ADS1015
 // ADS1015 is used if extra ADC channels are needed (declared below)
@@ -84,97 +87,102 @@
 
 // ───── Configuration ─────────────────────────────────────────────────────────
 // WiFi credentials (tries all and picks best signal)
-const char* WIFI_SSID1     = "DCLXVI";
-const char* WIFI_PASS1     = "1029384756";
-const char* WIFI_SSID2     = "BBWV_Oprasional";
-const char* WIFI_PASS2     = "Balai5-OPRA123!";
-const char* WIFI_SSID3     = "BMKG-JAYAPURA";
-const char* WIFI_PASS3     = "bmkg@123";
+const char* WIFI_SSID1 = "DCLXVI";
+const char* WIFI_PASS1 = "1029384756";
+const char* WIFI_SSID2 = "BBWV_Oprasional";
+const char* WIFI_PASS2 = "Balai5-OPRA123!";
+const char* WIFI_SSID3 = "BMKG-JAYAPURA";
+const char* WIFI_PASS3 = "bmkg@123";
 
 // NTP
-const char* NTP_SERVER     = "pool.ntp.org";
-const long  GMT_OFFSET_SEC = 9 * 3600;   // UTC+9 (adjust if needed)
-const int   DAYLIGHT_OFFSET_SEC = 0;
+const char* NTP_SERVER = "pool.ntp.org";
+const long GMT_OFFSET_SEC = 9 * 3600;  // UTC+9 (adjust if needed)
+const int DAYLIGHT_OFFSET_SEC = 0;
 
 // MQTT
-const char* MQTT_SERVER    = "192.168.88.88";
-const int   MQTT_PORT      = 1883;
+const char* MQTT_SERVER = "192.168.88.88";
+const int MQTT_PORT = 1883;
 const char* MQTT_CLIENT_ID = "garden_esp32";
 const char* MQTT_TOPIC_PUB = "garden/sensors";
 const char* MQTT_TOPIC_CMD = "garden/commands";
 
 // Timing
-const unsigned long PUBLISH_INTERVAL_MS = 60000UL;  // 1 minute
-const unsigned long SAMPLE_INTERVAL_MS  = 5000UL;   // 5 seconds
+const unsigned long CYCLE_INTERVAL_MS = 120000UL;  // 2 minutes total cycle
 
 // Thresholds
-const int   SOIL_DRY_THRESHOLD  = 2800;  // ADC raw (0-4095, dry = high value for cap. sensor)
-const int   SOIL_WET_THRESHOLD  = 1800;
+const int SOIL_DRY_THRESHOLD = 2800;  // ADC raw (0-4095, dry = high value for cap. sensor)
+const int SOIL_WET_THRESHOLD = 1800;
 // Raindrop sensor threshold removed (using pressure trend)
-const float TEMP_HOT_THRESHOLD  = 35.0f; // °C
+const float TEMP_HOT_THRESHOLD = 35.0f;  // °C
 
 // Watering
-const unsigned long WATER_MAX_MS = 60000UL; // 1 minute max
+const unsigned long WATER_MAX_MS = 180000UL;  // 3 minutes max
 
-// INA226 config (I2C address 0x45: A1=VS, A0=VS)
-// Shunt confirmed = R100 (0.1 Ohm)
-// Note: With an R100 shunt, the physical maximum measurable current before ADC clipping is ~819mA.
-#define INA226_SHUNT_OHM  0.100f  // R100 = 0.1 Ohm
-#define INA226_MAX_A      1.0f    // Changed back to 1.0f to prevent configuration failure (0.0mA bug)
 
-// Current Offset: Used if the INA226 only measures the solar input branch.
-// Subtracts the constant ESP32 load (~100-110mA) to calculate NET battery current.
-#define INA_I_OFFSET_mA  -135.0f  
+#define INA226_SHUNT_OHM 0.0115f         // Soldered R010 = 0.010 Ohm, but add fine tunning
+#define INA226_Current_LSB_mA 0.20f      // Max measurable current = 32768 x current_LSB.
+#define INA226_Current_Zero_Offset 0.0f  // current_zero_offset_mA (Current Zero Offset in milli Amperes, default = 0)
+#define INA226_Bus_V_scaling 10000       /* bus_V_scaling_e4 (Bus Voltage Scaling Factor, default = 10000) */
+
+#define INA226_I_OFFSET_mA -198.593f
+#define INA226_V_OFFSET_v -0.155f
 
 // ───── Global Objects ────────────────────────────────────────────────────────
-WiFiMulti     wifiMulti;
-WiFiClient    wifiClient;
-PubSubClient  mqttClient(wifiClient);
+WiFiMulti wifiMulti;
+WiFiClient wifiClient;
+PubSubClient mqttClient(wifiClient);
 
-OneWire           oneWire(PIN_DS18B20);
+OneWire oneWire(PIN_DS18B20);
 DallasTemperature ds18b20(&oneWire);
 
-Adafruit_AHTX0    aht10;
-Adafruit_BMP280   bmp280;
+Adafruit_AHTX0 aht10;
+Adafruit_BMP280 bmp280;
 ClosedCube_HDC1080 hdc1080;
-INA226            ina226(0x45);
-RTC_DS3231        rtc;
+INA226 ina226(0x45);
+RTC_DS3231 rtc;
 
 // RS485 Serial
 HardwareSerial rs485Serial(2);  // UART2
 
 // ───── State Variables ───────────────────────────────────────────────────────
-unsigned long lastPublishMs   = 0;
-unsigned long lastSampleMs    = 0;
+enum CycleState {
+  STATE_SENSORS_OFF,
+  STATE_SENSORS_WARMUP,
+  STATE_SAMPLING
+};
+CycleState cycleState = STATE_SENSORS_WARMUP; // Start with warmup to get initial readings
+unsigned long stateTimer = 0;
+int sampleCount = 0;
+
 unsigned long wateringStartMs = 0;
-bool          isWatering      = false;
-float         wateringStartMoisture = 0.0f;
-bool          manualWateringActive = false;
+bool isWatering = false;
+float wateringStartMoisture = 0.0f;
+bool manualWateringActive = false;
 
 struct SensorData {
   // Soil moisture (raw ADC, average of 3 sensors)
-  int   soil1Raw, soil2Raw, soil3Raw;
-  float soilMoistureAvgPct;   // 0–100 %
-  float soilTempC;            // DS18B20
+  int soil1Raw, soil2Raw, soil3Raw;
+  float soilMoistureAvgPct;  // 0–100 %
+  float soilTempC;           // DS18B20
   // Ambient
   float ambientTempC;
   float humidityPct;
   // UV
   float uvIndex;
   // Rain
-  int   rainRaw;  // Now unused or for compatibility
-  bool  isRaining; // Based on sensors or remote prediction
+  int rainRaw;     // Now unused or for compatibility
+  bool isRaining;  // Based on sensors or remote prediction
   // NPK + PH (read continuously)
   float nitrogenPpm;
   float phosphorusPpm;
   float potassiumPpm;
   float phValue;
-  bool  npkValid;
+  bool npkValid;
   // Power
   float busVoltageV;
   float currentMA;
   float powerMW;
-  bool  isCharging;
+  bool isCharging;
   // New Sensors
   float envTempC;
   float envHumPct;
@@ -186,34 +194,53 @@ struct SensorData {
   // Status Flags (0=OK, 1=WARN, 2=ERR)
   uint8_t stat_rtc, stat_npk, stat_aht, stat_ds18, stat_ina, stat_bmp, stat_hdc;
   // Pressure history for offline rain detection (last 3 hours, every 15 mins)
-  float presHistory[12]; 
-  int   presIdx = 0;
-  bool  presHistReady = false;
+  float presHistory[12];
+  int presIdx = 0;
+  bool presHistReady = false;
   unsigned long lastPresHistoryUpdate = 0;
-  bool  remoteRainPredicted = false;
+  bool remoteRainPredicted = false;
   unsigned long lastRemoteRainMs = 0;
 } sensorData;
 
 // ───── Accumulator for 1-minute averaging ────────────────────────────────────
 struct SensorAccumulator {
-  float soilMoistureAvgPct; int c_soilMoisture;
-  float soilTempC; int c_soilTemp;
-  float ambientTempC; int c_ambientTemp;
-  float humidityPct; int c_humidity;
-  float uvIndex; int c_uv;
-  float nitrogenPpm; int c_nitrogen;
-  float phosphorusPpm; int c_phosphorus;
-  float potassiumPpm; int c_potassium;
-  float phValue; int c_ph;
-  float busVoltageV; int c_busVoltage;
-  float currentMA; int c_current;
-  float powerMW; int c_power;
-  float envTempC; int c_envTemp;
-  float envHumPct; int c_envHum;
-  float intTempC; int c_intTemp;
-  float intPresHPa; int c_intPres;
-  float socTempC; int c_socTemp;
-  void reset() { memset(this, 0, sizeof(SensorAccumulator)); }
+  float soilMoistureAvgPct;
+  int c_soilMoisture;
+  float soilTempC;
+  int c_soilTemp;
+  float ambientTempC;
+  int c_ambientTemp;
+  float humidityPct;
+  int c_humidity;
+  float uvIndex;
+  int c_uv;
+  float nitrogenPpm;
+  int c_nitrogen;
+  float phosphorusPpm;
+  int c_phosphorus;
+  float potassiumPpm;
+  int c_potassium;
+  float phValue;
+  int c_ph;
+  float busVoltageV;
+  int c_busVoltage;
+  float currentMA;
+  int c_current;
+  float powerMW;
+  int c_power;
+  float envTempC;
+  int c_envTemp;
+  float envHumPct;
+  int c_envHum;
+  float intTempC;
+  int c_intTemp;
+  float intPresHPa;
+  int c_intPres;
+  float socTempC;
+  int c_socTemp;
+  void reset() {
+    memset(this, 0, sizeof(SensorAccumulator));
+  }
 } acc;
 
 // ───── Forward Declarations ──────────────────────────────────────────────────
@@ -223,7 +250,8 @@ void connectMQTT();
 void mqttCallback(char* topic, byte* payload, unsigned int length);
 void readSensors();
 void readNPKandPH();
-void publishData();
+void processAndPublishData();
+void logSystemEvents();
 void checkAutoWatering();
 void controlValve(bool open, bool isManual = false);
 String buildJsonPayload();
@@ -242,8 +270,14 @@ void setup() {
   Serial.println(F("\n🌿 Garden Monitor Booting..."));
 
   // Pin modes
-  pinMode(PIN_MOSFET_VALVE, OUTPUT); digitalWrite(PIN_MOSFET_VALVE, LOW);
-  pinMode(PIN_RS485_DE_RE, OUTPUT); digitalWrite(PIN_RS485_DE_RE, LOW);
+  pinMode(PIN_MOSFET_VALVE, OUTPUT);
+  digitalWrite(PIN_MOSFET_VALVE, LOW);
+  pinMode(PIN_MOSFET_3V3, OUTPUT);
+  digitalWrite(PIN_MOSFET_3V3, HIGH); // Turn ON initially for setup
+  pinMode(PIN_MOSFET_5V, OUTPUT);
+  digitalWrite(PIN_MOSFET_5V, HIGH); // Turn ON initially for setup
+  pinMode(PIN_RS485_DE_RE, OUTPUT);
+  digitalWrite(PIN_RS485_DE_RE, LOW);
 
   // ADC attenuation for 0-3.3V range
   analogSetAttenuation(ADC_11db);
@@ -283,10 +317,24 @@ void setup() {
     Serial.println(F("⚠️  INA226 not found!"));
     sensorData.stat_ina = 2;
   } else {
-    // Match exactly the verified test sketch: setMaxCurrentShunt(maxA, shuntOhm)
-    ina226.setMaxCurrentShunt(INA226_MAX_A, INA226_SHUNT_OHM);
-    ina226.setAverage(2);  // 16-sample averaging for stable readings
-    sensorData.stat_ina = 0;
+    if (ina226.configure(INA226_SHUNT_OHM, INA226_Current_LSB_mA, INA226_Current_Zero_Offset, INA226_Bus_V_scaling)) {
+      Serial.println("\n***** Configuration Error! Chosen values outside range *****\n");
+    } else {
+      Serial.println("\n***** INA 226 CONFIGURE *****");
+      Serial.print("Shunt:\t");
+      Serial.print(INA226_SHUNT_OHM, 4);
+      Serial.println(" Ohm");
+      Serial.print("current_LSB_mA:\t");
+      Serial.print(INA226_Current_LSB_mA * 1e+3, 1);
+      Serial.println(" uA / bit");
+      Serial.print("\nMax Measurable Current:\t");
+      Serial.print(ina226.getMaxCurrent(), 3);
+      Serial.println(" A");
+      Serial.println(" ");
+
+      ina226.setAverage(2);  // 16-sample averaging for stable readings
+      sensorData.stat_ina = 0;
+    }
   }
 
 
@@ -311,13 +359,14 @@ void setup() {
   mqttClient.setBufferSize(1024);
   connectMQTT();
 
+  // Enable Auto Modem Sleep for WiFi
+  esp_wifi_set_ps(WIFI_PS_MAX_MODEM);
+  Serial.println(F("✅ WiFi Auto Modem Sleep enabled"));
+
   Serial.println(F("✅ Setup complete!"));
   acc.reset();
-  // Initialize both timers to now so:
-  //   - samples start immediately (lastSampleMs trick removed, handled by ==0 check)
-  //   - first publish waits a FULL minute of real sensor samples (not zeros)
-  lastSampleMs  = millis() - SAMPLE_INTERVAL_MS;  // triggers first sample immediately
-  lastPublishMs = millis();                         // first publish after 60s of samples
+  
+  stateTimer = millis(); // Start the state machine
 }
 
 // =============================================================================
@@ -330,41 +379,49 @@ void loop() {
 
   unsigned long now = millis();
 
-  // Sample every 5 seconds
-  if (now - lastSampleMs >= SAMPLE_INTERVAL_MS) {
-    lastSampleMs = now;
-    readSensors();
-  }
+  switch (cycleState) {
+    case STATE_SENSORS_OFF:
+      // Wait for 105 seconds with sensors off
+      if (now - stateTimer >= 105000UL) {
+        digitalWrite(PIN_MOSFET_3V3, HIGH);
+        digitalWrite(PIN_MOSFET_5V, HIGH);
+        stateTimer = now;
+        cycleState = STATE_SENSORS_WARMUP;
+        Serial.println(F("⚡ Sensors ON, warming up..."));
+      }
+      break;
 
-  // Publish every minute — only after accumulator has real data
-  if (now - lastPublishMs >= PUBLISH_INTERVAL_MS) {
-    lastPublishMs = now;
-    // Average out the accumulated values
-    auto avg = [](float sum, int count) -> float { return count > 0 ? sum / count : 0.0f; };
-    sensorData.soilMoistureAvgPct = avg(acc.soilMoistureAvgPct, acc.c_soilMoisture);
-    sensorData.soilTempC          = avg(acc.soilTempC, acc.c_soilTemp);
-    sensorData.ambientTempC       = avg(acc.ambientTempC, acc.c_ambientTemp);
-    sensorData.humidityPct        = avg(acc.humidityPct, acc.c_humidity);
-    sensorData.uvIndex            = avg(acc.uvIndex, acc.c_uv);
-    sensorData.nitrogenPpm        = avg(acc.nitrogenPpm, acc.c_nitrogen);
-    sensorData.phosphorusPpm      = avg(acc.phosphorusPpm, acc.c_phosphorus);
-    sensorData.potassiumPpm       = avg(acc.potassiumPpm, acc.c_potassium);
-    sensorData.phValue            = avg(acc.phValue, acc.c_ph);
-    sensorData.busVoltageV        = avg(acc.busVoltageV, acc.c_busVoltage);
-    sensorData.currentMA          = avg(acc.currentMA, acc.c_current);
-    sensorData.powerMW            = avg(acc.powerMW, acc.c_power);
-    sensorData.envTempC           = avg(acc.envTempC, acc.c_envTemp);
-    sensorData.envHumPct          = avg(acc.envHumPct, acc.c_envHum);
-    sensorData.intTempC           = avg(acc.intTempC, acc.c_intTemp);
-    sensorData.intPresHPa         = avg(acc.intPresHPa, acc.c_intPres);
-    sensorData.socTempC           = avg(acc.socTempC, acc.c_socTemp);
+    case STATE_SENSORS_WARMUP:
+      // Wait 5 seconds for sensors to stabilize
+      if (now - stateTimer >= 5000UL) {
+        stateTimer = now;
+        sampleCount = 0;
+        acc.reset();
+        cycleState = STATE_SAMPLING;
+        Serial.println(F("🔍 Warmup done, sampling..."));
+      }
+      break;
 
-    // Reset accumulators after average
-    acc.reset();
-    
-    checkAutoWatering();
-    publishData();
-    printSensorReadings();  // always print every minute to Serial
+    case STATE_SAMPLING:
+      // Sample 5 times over 10 seconds (every 2 seconds)
+      if (now - stateTimer >= 2000UL) {
+        stateTimer = now;
+        readSensors();
+        sampleCount++;
+        if (sampleCount >= 5) {
+          // Done sampling
+          processAndPublishData();
+          checkAutoWatering();
+          logSystemEvents();
+
+          digitalWrite(PIN_MOSFET_3V3, LOW);
+          digitalWrite(PIN_MOSFET_5V, LOW);
+          stateTimer = now;
+          cycleState = STATE_SENSORS_OFF;
+          Serial.println(F("💤 Publish done, sensors OFF."));
+        }
+      }
+      break;
   }
 
   // Watering watchdog – cut off after max time
@@ -373,7 +430,7 @@ void loop() {
     controlValve(false);
   }
 
-  delay(100);
+  delay(100); // Allow Auto Modem Sleep to kick in
 }
 
 // =============================================================================
@@ -395,7 +452,7 @@ void connectWiFi() {
     }
   }
   Serial.printf("\n✅ WiFi connected: %s (IP: %s)\n",
-    WiFi.SSID().c_str(), WiFi.localIP().toString().c_str());
+                WiFi.SSID().c_str(), WiFi.localIP().toString().c_str());
 }
 
 // =============================================================================
@@ -408,13 +465,14 @@ void syncNTP() {
   struct tm timeinfo;
   int retry = 0;
   while (!getLocalTime(&timeinfo) && retry++ < 10) {
-    delay(1000); Serial.print('.');
+    delay(1000);
+    Serial.print('.');
   }
   if (retry < 10) {
     char buf[32];
     strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", &timeinfo);
     Serial.printf("\n✅ Time synced via NTP: %s\n", buf);
-    
+
     // Sync RTC if it's connected
     if (sensorData.stat_rtc != 2) {
       rtc.adjust(DateTime(timeinfo.tm_year + 1900, timeinfo.tm_mon + 1, timeinfo.tm_mday, timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec));
@@ -460,7 +518,7 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
     controlValve(false);
   } else if (strcmp(cmd, "sync_rtc") == 0) {
     syncNTP();
-    publishData(); // publish updated time
+    // publishData();  // Removed as it expects fresh samples
   } else if (strcmp(cmd, "weather_prediction") == 0) {
     sensorData.remoteRainPredicted = doc["raining"] | false;
     sensorData.lastRemoteRainMs = millis();
@@ -481,14 +539,17 @@ void readSensors() {
     if (getLocalTime(&timeinfo, 10)) {
       sensorData.timestamp = mktime(&timeinfo);
     } else {
-      sensorData.timestamp = millis() / 1000; // ultimate fallback
+      sensorData.timestamp = millis() / 1000;  // ultimate fallback
     }
   }
 
   // ── Soil Moisture (ADC1, averaged 5 samples each) ──
   auto readADC = [](int pin, int n = 5) -> int {
     long sum = 0;
-    for (int i = 0; i < n; i++) { sum += analogRead(pin); delay(5); }
+    for (int i = 0; i < n; i++) {
+      sum += analogRead(pin);
+      delay(5);
+    }
     return sum / n;
   };
 
@@ -499,23 +560,36 @@ void readSensors() {
   float m1 = rawToMoisturePct(sensorData.soil1Raw);
   float m2 = rawToMoisturePct(sensorData.soil2Raw);
   float m3 = rawToMoisturePct(sensorData.soil3Raw);
-  
-  float m[3] = {m1, m2, m3};
+
+  float m[3] = { m1, m2, m3 };
   // Sort values
-  if (m[0] > m[1]) { float t = m[0]; m[0] = m[1]; m[1] = t; }
-  if (m[1] > m[2]) { float t = m[1]; m[1] = m[2]; m[2] = t; }
-  if (m[0] > m[1]) { float t = m[0]; m[0] = m[1]; m[1] = t; }
-  
+  if (m[0] > m[1]) {
+    float t = m[0];
+    m[0] = m[1];
+    m[1] = t;
+  }
+  if (m[1] > m[2]) {
+    float t = m[1];
+    m[1] = m[2];
+    m[2] = t;
+  }
+  if (m[0] > m[1]) {
+    float t = m[0];
+    m[0] = m[1];
+    m[1] = t;
+  }
+
   float avg = 0;
   if ((m[2] - m[1]) > 15.0f) {
-      avg = (m[0] + m[1]) / 2.0f; // Exclude high outlier
+    avg = (m[0] + m[1]) / 2.0f;  // Exclude high outlier
   } else if ((m[1] - m[0]) > 15.0f) {
-      avg = (m[1] + m[2]) / 2.0f; // Exclude low outlier
+    avg = (m[1] + m[2]) / 2.0f;  // Exclude low outlier
   } else {
-      avg = (m[0] + m[1] + m[2]) / 3.0f;
+    avg = (m[0] + m[1] + m[2]) / 3.0f;
   }
-  
-  acc.soilMoistureAvgPct += avg; acc.c_soilMoisture++;
+
+  acc.soilMoistureAvgPct += avg;
+  acc.c_soilMoisture++;
 
   // ── DS18B20 Soil Temperature ──
   if (sensorData.stat_ds18 != 2) {
@@ -524,7 +598,8 @@ void readSensors() {
     if (val <= -100.0f) sensorData.stat_ds18 = 2;
     else {
       val = (val * MULT_SOIL_TEMP) + OFFSET_SOIL_TEMP;
-      acc.soilTempC += val; acc.c_soilTemp++;
+      acc.soilTempC += val;
+      acc.c_soilTemp++;
     }
   }
 
@@ -534,8 +609,10 @@ void readSensors() {
     if (aht10.getEvent(&hum, &temp)) {
       float aTemp = (temp.temperature * MULT_AHT_TEMP) + OFFSET_AHT_TEMP;
       float aHum = (hum.relative_humidity * MULT_AHT_HUMIDITY) + OFFSET_AHT_HUMIDITY;
-      acc.ambientTempC += aTemp; acc.c_ambientTemp++;
-      acc.humidityPct += aHum; acc.c_humidity++;
+      acc.ambientTempC += aTemp;
+      acc.c_ambientTemp++;
+      acc.humidityPct += aHum;
+      acc.c_humidity++;
     } else {
       sensorData.stat_aht = 2;
     }
@@ -544,9 +621,11 @@ void readSensors() {
   // ── HDC1080 Environment 1 ──
   float hdcT = (hdc1080.readTemperature() * MULT_HDC_TEMP) + OFFSET_HDC_TEMP;
   float hdcH = (hdc1080.readHumidity() * MULT_HDC_HUM) + OFFSET_HDC_HUM;
-  if (hdcT < 120.0f) { // Arbitrary validity check
-    acc.envTempC += hdcT; acc.c_envTemp++;
-    acc.envHumPct += hdcH; acc.c_envHum++;
+  if (hdcT < 120.0f) {  // Arbitrary validity check
+    acc.envTempC += hdcT;
+    acc.c_envTemp++;
+    acc.envHumPct += hdcH;
+    acc.c_envHum++;
     sensorData.stat_hdc = 0;
   } else {
     sensorData.stat_hdc = 2;
@@ -556,44 +635,48 @@ void readSensors() {
   if (sensorData.stat_bmp != 2) {
     float bmpT = (bmp280.readTemperature() * MULT_BMP_TEMP) + OFFSET_BMP_TEMP;
     float bmpP = (bmp280.readPressure() / 100.0F * MULT_BMP_PRES) + OFFSET_BMP_PRES;
-    acc.intTempC += bmpT; acc.c_intTemp++;
-    acc.intPresHPa += bmpP; acc.c_intPres++;
+    acc.intTempC += bmpT;
+    acc.c_intTemp++;
+    acc.intPresHPa += bmpP;
+    acc.c_intPres++;
   }
 
   // ── ESP32 SoC Temperature ──
   float socT = (temperatureRead() * MULT_SOC_TEMP) + OFFSET_SOC_TEMP;
-  acc.socTempC += socT; acc.c_socTemp++;
+  acc.socTempC += socT;
+  acc.c_socTemp++;
 
   // ── UV Index (GUVA-S12SD) ──
   int uvRaw = readADC(PIN_UV);
   float uvI = (rawToUVIndex(uvRaw) * MULT_UV) + OFFSET_UV;
-  acc.uvIndex += uvI; acc.c_uv++;
+  acc.uvIndex += uvI;
+  acc.c_uv++;
 
   // ── Raindrop (PHYSICAL MODULE REMOVED) ──
   // Now using BMP280, AHT10, HDC1080 and UV for detection
   // This is handled at the end of readSensors()
-  sensorData.rainRaw = 0; 
+  sensorData.rainRaw = 0;
 
   // ── INA226 Power Monitor ──
   if (sensorData.stat_ina != 2) {
-    float busV   = ina226.getBusVoltage();
-    // Bypass library calibration bugs: calculate directly from Raw Shunt Voltage!
-    // I(mA) = V(mV) / R(Ohms)
+    float busV = ina226.getBusVoltage() + INA226_V_OFFSET_v;
     float shuntMV = ina226.getShuntVoltage_mV();
-    // Add the manual offset to simulate net battery current (Charger Input minus ESP32 Load)
-    float currMA  = (shuntMV / INA226_SHUNT_OHM) + INA_I_OFFSET_mA;
-    float powMW   = busV * currMA; // P(mW) = V(V) * I(mA)
-    acc.busVoltageV += busV;   acc.c_busVoltage++;
-    acc.currentMA   += currMA; acc.c_current++;
-    acc.powerMW     += powMW;  acc.c_power++;
+    float currMA = ina226.getCurrent_mA() + INA226_I_OFFSET_mA;
+    float powMW = (busV - shuntMV / 1000) * currMA;  // P(mW) = V(V) * I(mA)
+    acc.busVoltageV += busV;
+    acc.c_busVoltage++;
+    acc.currentMA += currMA;
+    acc.c_current++;
+    acc.powerMW += powMW;
+    acc.c_power++;
     // Keep live values for auto-watering/charging detection
     sensorData.busVoltageV = busV;
-    sensorData.currentMA   = currMA;
-    sensorData.isCharging  = (currMA > 0);  // positive = charger pushing current in
+    sensorData.currentMA = currMA;
+    sensorData.isCharging = (currMA > 0);  // positive = charger pushing current in
   }
 
   // ── Fallback Rain Detection (Offline) ──
-  sensorData.isRaining = false; // Reset each cycle so it doesn't get stuck
+  sensorData.isRaining = false;  // Reset each cycle so it doesn't get stuck
 
   // Update pressure history every 15 minutes
   unsigned long nowMs = millis();
@@ -606,9 +689,9 @@ void readSensors() {
 
     if (sensorData.presHistReady) {
       // Calculate drop over 3 hours
-      float oldPres = sensorData.presHistory[sensorData.presIdx]; 
+      float oldPres = sensorData.presHistory[sensorData.presIdx];
       float drop = oldPres - currentPres;
-      
+
       if (drop > 3.0) sensorData.isRaining = true;
       Serial.printf("📊 Pressure Trend: %.2f hPa drop over 3h\n", drop);
     }
@@ -619,7 +702,7 @@ void readSensors() {
   if (curHum > 96.0f) sensorData.isRaining = true;
 
   // Daylight Smart Detection (Solar + UV)
-  bool isDay = true; 
+  bool isDay = true;
   if (sensorData.stat_rtc != 2) {
     DateTime now = rtc.now();
     if (now.hour() < 7 || now.hour() > 17) isDay = false;
@@ -659,18 +742,22 @@ float rawToUVIndex(int raw) {
 }
 
 // =============================================================================
-//  NPK + PH (RS485 Modbus RTU)
+//  NPK (RS485 Modbus RTU)
 // =============================================================================
 void readNPKandPH() {
   // Some NPK sensors strictly reject multi-register reads (Count=0x03).
   // We will read them sequentially just like the debug script!
   auto readNPKReg = [](uint8_t* query) -> int {
-    while(rs485Serial.available()) rs485Serial.read();
-    digitalWrite(PIN_RS485_DE_RE, HIGH); delay(2);
-    rs485Serial.write(query, 8); rs485Serial.flush();
-    delay(2); digitalWrite(PIN_RS485_DE_RE, LOW);
-    
-    uint8_t buf[20]; int len = 0;
+    while (rs485Serial.available()) rs485Serial.read();
+    digitalWrite(PIN_RS485_DE_RE, HIGH);
+    delay(2);
+    rs485Serial.write(query, 8);
+    rs485Serial.flush();
+    delay(2);
+    digitalWrite(PIN_RS485_DE_RE, LOW);
+
+    uint8_t buf[20];
+    int len = 0;
     unsigned long t = millis();
     while (millis() - t < 300) {
       while (rs485Serial.available()) {
@@ -678,29 +765,34 @@ void readNPKandPH() {
         else rs485Serial.read();
       }
     }
-    
+
     // Scan dynamically for Modbus frame start (ignoring leading noise)
     for (int i = 0; i < len - 2; i++) {
-      if (buf[i] == 0x01 && buf[i+1] == 0x03 && buf[i+2] == 0x02) {
-        if (i + 4 < len) return (buf[i+3] << 8) | buf[i+4];
+      if (buf[i] == 0x01 && buf[i + 1] == 0x03 && buf[i + 2] == 0x02) {
+        if (i + 4 < len) return (buf[i + 3] << 8) | buf[i + 4];
       }
     }
     return -1;
   };
 
   // Pre-calculated CRCs for registers 0x001E, 0x001F, 0x0020 (Length=1)
-  uint8_t qN[] = {0x01, 0x03, 0x00, 0x1E, 0x00, 0x01, 0xE4, 0x0C};
-  uint8_t qP[] = {0x01, 0x03, 0x00, 0x1F, 0x00, 0x01, 0xB5, 0xCC};
-  uint8_t qK[] = {0x01, 0x03, 0x00, 0x20, 0x00, 0x01, 0x85, 0xC0};
+  uint8_t qN[] = { 0x01, 0x03, 0x00, 0x1E, 0x00, 0x01, 0xE4, 0x0C };
+  uint8_t qP[] = { 0x01, 0x03, 0x00, 0x1F, 0x00, 0x01, 0xB5, 0xCC };
+  uint8_t qK[] = { 0x01, 0x03, 0x00, 0x20, 0x00, 0x01, 0x85, 0xC0 };
 
-  int n = readNPKReg(qN); delay(50);
-  int p = readNPKReg(qP); delay(50);
+  int n = readNPKReg(qN);
+  delay(50);
+  int p = readNPKReg(qP);
+  delay(50);
   int k = readNPKReg(qK);
 
   if (n != -1 && p != -1 && k != -1) {
-    acc.nitrogenPpm += (n * MULT_N) + OFFSET_N; acc.c_nitrogen++;
-    acc.phosphorusPpm += (p * MULT_P) + OFFSET_P; acc.c_phosphorus++;
-    acc.potassiumPpm += (k * MULT_K) + OFFSET_K; acc.c_potassium++;
+    acc.nitrogenPpm += (n * MULT_N) + OFFSET_N;
+    acc.c_nitrogen++;
+    acc.phosphorusPpm += (p * MULT_P) + OFFSET_P;
+    acc.c_phosphorus++;
+    acc.potassiumPpm += (k * MULT_K) + OFFSET_K;
+    acc.c_potassium++;
     sensorData.npkValid = true;
     sensorData.stat_npk = 0;
   } else {
@@ -716,21 +808,13 @@ void readNPKandPH() {
     delay(5);
   }
   int phRaw12Bit = phSum / 10;
-  // User's formula was calibrated on an Arduino Uno (5V Reference, 10-bit ADC: 0-1023).
-  // The ESP32 is a 3.3V Reference, 12-bit ADC (0-4095).
-  // We must translate the ESP32's raw reading exactly back to what an Uno would have read for the same voltage:
-  // Uno_ADC = ESP_ADC * (3.3V / 4095) * (1023 / 5.0V) = ESP_ADC * 0.16489
   float sensorValue10Bit = (float)phRaw12Bit * 0.16489f;
-  
-  // The user's formula was completely misaligned with the hardware's 1.6V output.
-  // Standard analog PH sensors output a median voltage (around 1.65V when powered by 3.3V) at PH 7.0.
-  // We use the standard generic PH curve: pH = -5.70 * Voltage + calibration_offset
-  // For a 1.65V center: offset = 16.4
   float actualVoltage = (float)phRaw12Bit * 3.3f / 4095.0f;
-  float phV = (-5.70f * actualVoltage) + 16.4f;
+  float phV = (-24.36 * actualVoltage) + 22.34;
   phV = (phV * MULT_PH) + OFFSET_PH;
-  
-  acc.phValue += phV; acc.c_ph++;
+
+  acc.phValue += phV;
+  acc.c_ph++;
 }
 
 // =============================================================================
@@ -751,7 +835,7 @@ void checkAutoWatering() {
 void controlValve(bool open, bool isManual) {
   if (isWatering == open) return;
   isWatering = open;
-  
+
   if (open) {
     wateringStartMs = millis();
     wateringStartMoisture = sensorData.soilMoistureAvgPct;
@@ -759,27 +843,50 @@ void controlValve(bool open, bool isManual) {
   } else {
     unsigned long durationSec = (millis() - wateringStartMs) / 1000;
     float endMoist = sensorData.soilMoistureAvgPct;
-    
+
     StaticJsonDocument<256> logDoc;
     logDoc["type"] = "watering_log";
     logDoc["duration_sec"] = durationSec;
     logDoc["start_moist"] = round(wateringStartMoisture * 10) / 10.0;
     logDoc["end_moist"] = round(endMoist * 10) / 10.0;
     logDoc["is_manual"] = manualWateringActive;
-    
+
     char logBuffer[256];
     serializeJson(logDoc, logBuffer);
     mqttClient.publish(MQTT_TOPIC_PUB, logBuffer);
   }
-  
+
   digitalWrite(PIN_MOSFET_VALVE, open ? HIGH : LOW);
   Serial.printf("💧 Valve: %s\n", open ? "OPEN" : "CLOSED");
 }
 
 // =============================================================================
-//  MQTT Publish
+//  MQTT Publish & Process
 // =============================================================================
-void publishData() {
+void processAndPublishData() {
+  auto avg = [](float sum, int count) -> float {
+    return count > 0 ? sum / count : 0.0f;
+  };
+  sensorData.soilMoistureAvgPct = avg(acc.soilMoistureAvgPct, acc.c_soilMoisture);
+  sensorData.soilTempC = avg(acc.soilTempC, acc.c_soilTemp);
+  sensorData.ambientTempC = avg(acc.ambientTempC, acc.c_ambientTemp);
+  sensorData.humidityPct = avg(acc.humidityPct, acc.c_humidity);
+  sensorData.uvIndex = avg(acc.uvIndex, acc.c_uv);
+  sensorData.nitrogenPpm = avg(acc.nitrogenPpm, acc.c_nitrogen);
+  sensorData.phosphorusPpm = avg(acc.phosphorusPpm, acc.c_phosphorus);
+  sensorData.potassiumPpm = avg(acc.potassiumPpm, acc.c_potassium);
+  sensorData.phValue = avg(acc.phValue, acc.c_ph);
+  sensorData.busVoltageV = avg(acc.busVoltageV, acc.c_busVoltage);
+  sensorData.currentMA = avg(acc.currentMA, acc.c_current);
+  sensorData.powerMW = avg(acc.powerMW, acc.c_power);
+  sensorData.envTempC = avg(acc.envTempC, acc.c_envTemp);
+  sensorData.envHumPct = avg(acc.envHumPct, acc.c_envHum);
+  sensorData.intTempC = avg(acc.intTempC, acc.c_intTemp);
+  sensorData.intPresHPa = avg(acc.intPresHPa, acc.c_intPres);
+  sensorData.socTempC = avg(acc.socTempC, acc.c_socTemp);
+
+  acc.reset();
+
   if (!mqttClient.connected()) {
     connectMQTT();
     if (!mqttClient.connected()) return;
@@ -788,86 +895,118 @@ void publishData() {
   String payload = buildJsonPayload();
   mqttClient.publish(MQTT_TOPIC_PUB, payload.c_str(), false);
   Serial.printf("📤 Published %d bytes to %s\n", payload.length(), MQTT_TOPIC_PUB);
+  
+  printSensorReadings();
+}
+
+void logSystemEvents() {
+  StaticJsonDocument<512> doc;
+  doc["type"] = "system_event";
+  doc["ts"] = sensorData.timestamp;
+  
+  JsonArray events = doc.createNestedArray("events");
+  
+  if (sensorData.busVoltageV < 11.5f && sensorData.busVoltageV > 1.0f && sensorData.stat_ina != 2) {
+      events.add("Low Battery Warning: " + String(sensorData.busVoltageV, 1) + "V");
+  } else if (sensorData.busVoltageV > 13.8f && sensorData.stat_ina != 2) {
+      events.add("Battery Full: " + String(sensorData.busVoltageV, 1) + "V");
+  }
+  
+  if (sensorData.stat_rtc == 2) events.add("RTC Error");
+  if (sensorData.stat_aht == 2) events.add("AHT10 Error");
+  if (sensorData.stat_bmp == 2) events.add("BMP280 Error");
+  if (sensorData.stat_hdc == 2) events.add("HDC1080 Error");
+  if (sensorData.stat_ina == 2) events.add("INA226 Error");
+  if (sensorData.stat_npk == 2) events.add("NPK Sensor Error");
+  
+  if (events.size() > 0) {
+      char buffer[512];
+      serializeJson(doc, buffer);
+      mqttClient.publish(MQTT_TOPIC_PUB, buffer);
+      Serial.println(F("⚠️  Published system events"));
+  }
 }
 
 void printSensorReadings() {
   Serial.println();
   Serial.println(F("--- Sensor Readings (Calibrated 1-min Avg) ---"));
-  Serial.printf("  Soil Moisture    : %.1f %%\n",   sensorData.soilMoistureAvgPct);
-  Serial.printf("  Soil Temp        : %.1f C\n",    sensorData.soilTempC);
+  Serial.printf("  Soil Moisture    : %.1f %%\n", sensorData.soilMoistureAvgPct);
+  Serial.printf("  Soil Temp        : %.1f C\n", sensorData.soilTempC);
   if (sensorData.stat_aht != 2) {
-    Serial.printf("  Env2 Temp (AHT)  : %.1f C\n",  sensorData.ambientTempC);
+    Serial.printf("  Env2 Temp (AHT)  : %.1f C\n", sensorData.ambientTempC);
     Serial.printf("  Env2 Hum  (AHT)  : %.1f %%\n", sensorData.humidityPct);
   } else Serial.println(F("  Env2 (AHT10)     : [ERROR]"));
   if (sensorData.stat_hdc != 2) {
-    Serial.printf("  Env1 Temp (HDC)  : %.1f C\n",  sensorData.envTempC);
+    Serial.printf("  Env1 Temp (HDC)  : %.1f C\n", sensorData.envTempC);
     Serial.printf("  Env1 Hum  (HDC)  : %.1f %%\n", sensorData.envHumPct);
   } else Serial.println(F("  Env1 (HDC1080)   : [ERROR]"));
   if (sensorData.stat_bmp != 2) {
-    Serial.printf("  Enclosure Temp   : %.1f C\n",  sensorData.intTempC);
-    Serial.printf("  Enclosure Pres   : %.1f hPa\n",sensorData.intPresHPa);
+    Serial.printf("  Enclosure Temp   : %.1f C\n", sensorData.intTempC);
+    Serial.printf("  Enclosure Pres   : %.1f hPa\n", sensorData.intPresHPa);
   } else Serial.println(F("  Enclosure (BMP)  : [ERROR]"));
-  Serial.printf("  SoC Temp         : %.1f C\n",    sensorData.socTempC);
-  Serial.printf("  UV Index         : %.1f\n",       sensorData.uvIndex);
-  Serial.printf("  Rain Raw         : %d (%s)\n",    sensorData.rainRaw, sensorData.isRaining ? "RAIN" : "DRY");
-  Serial.printf("  Bus Voltage      : %.2f V\n",     sensorData.busVoltageV);
-  Serial.printf("  Current          : %.1f mA\n",    sensorData.currentMA);
-  Serial.printf("  Power            : %.1f mW\n",    sensorData.powerMW);
+  Serial.printf("  SoC Temp         : %.1f C\n", sensorData.socTempC);
+  Serial.printf("  UV Index         : %.1f\n", sensorData.uvIndex);
+  Serial.printf("  Rain Raw         : %d (%s)\n", sensorData.rainRaw, sensorData.isRaining ? "RAIN" : "DRY");
+  Serial.printf("  Bus Voltage      : %.2f V\n", sensorData.busVoltageV);
+  Serial.printf("  Current          : %.1f mA\n", sensorData.currentMA);
+  Serial.printf("  Power            : %.1f mW\n", sensorData.powerMW);
   if (sensorData.npkValid) {
     Serial.printf("  Nitrogen  (N)    : %.1f ppm\n", sensorData.nitrogenPpm);
     Serial.printf("  Phosphorus(P)    : %.1f ppm\n", sensorData.phosphorusPpm);
     Serial.printf("  Potassium (K)    : %.1f ppm\n", sensorData.potassiumPpm);
   } else Serial.println(F("  NPK              : [NO DATA]"));
-  Serial.printf("  PH               : %.2f\n",       sensorData.phValue);
+  Serial.printf("  PH               : %.2f\n", sensorData.phValue);
   Serial.println(F("----------------------------------------------"));
 }
 
 String buildJsonPayload() {
   StaticJsonDocument<1024> doc;
 
-  doc["ts"]              = sensorData.timestamp;
-  doc["soil1_raw"]       = sensorData.soil1Raw;
-  doc["soil2_raw"]       = sensorData.soil2Raw;
-  doc["soil3_raw"]       = sensorData.soil3Raw;
-  doc["soil_moisture"]   = round(sensorData.soilMoistureAvgPct * 10) / 10.0;
-  doc["soil_temp"]       = round(sensorData.soilTempC          * 10) / 10.0;
+  doc["ts"] = sensorData.timestamp;
+  doc["soil1_raw"] = sensorData.soil1Raw;
+  doc["soil2_raw"] = sensorData.soil2Raw;
+  doc["soil3_raw"] = sensorData.soil3Raw;
+  doc["soil_moisture"] = round(sensorData.soilMoistureAvgPct * 10) / 10.0;
+  doc["soil_temp"] = round(sensorData.soilTempC * 10) / 10.0;
   if (sensorData.stat_aht != 2) {
-    doc["ambient_temp"]    = round(sensorData.ambientTempC       * 10) / 10.0;
-    doc["humidity"]        = round(sensorData.humidityPct        * 10) / 10.0;
+    doc["ambient_temp"] = round(sensorData.ambientTempC * 10) / 10.0;
+    doc["humidity"] = round(sensorData.humidityPct * 10) / 10.0;
   }
-  
-  doc["uv_index"]        = round(sensorData.uvIndex      * 10) / 10.0;
-  doc["rain_raw"]        = sensorData.rainRaw;
-  doc["is_raining"]      = sensorData.isRaining;
-  doc["battery_v"]       = round(sensorData.busVoltageV  * 100) / 100.0;
-  doc["current_ma"]      = round(sensorData.currentMA    * 10) / 10.0;
-  doc["power_mw"]        = round(sensorData.powerMW      * 10) / 10.0;
-  doc["is_charging"]     = sensorData.isCharging;
-  doc["valve_open"]      = isWatering;
-  doc["wifi_ssid"]       = WiFi.SSID();
-  doc["wifi_rssi"]       = WiFi.RSSI();
-  doc["wifi_ip"]         = WiFi.localIP().toString();
+
+  doc["uv_index"] = round(sensorData.uvIndex * 10) / 10.0;
+  doc["rain_raw"] = sensorData.rainRaw;
+  doc["is_raining"] = sensorData.isRaining;
+  doc["battery_v"] = round(sensorData.busVoltageV * 100) / 100.0;
+  doc["current_ma"] = round(sensorData.currentMA * 10) / 10.0;
+  doc["power_mw"] = round(sensorData.powerMW * 10) / 10.0;
+  doc["is_charging"] = sensorData.isCharging;
+  doc["valve_open"] = isWatering;
+  doc["wifi_ssid"] = WiFi.SSID();
+  doc["wifi_rssi"] = WiFi.RSSI();
+  doc["wifi_ip"] = WiFi.localIP().toString();
 
   if (sensorData.stat_hdc != 2) {
-    doc["env_temp"]        = round(sensorData.envTempC           * 10) / 10.0;
-    doc["env_hum"]         = round(sensorData.envHumPct          * 10) / 10.0;
+    doc["env_temp"] = round(sensorData.envTempC * 10) / 10.0;
+    doc["env_hum"] = round(sensorData.envHumPct * 10) / 10.0;
   }
   if (sensorData.stat_bmp != 2) {
-    doc["int_temp"]        = round(sensorData.intTempC           * 10) / 10.0;
-    doc["int_pres"]        = round(sensorData.intPresHPa         * 10) / 10.0;
+    doc["int_temp"] = round(sensorData.intTempC * 10) / 10.0;
+    doc["int_pres"] = round(sensorData.intPresHPa * 10) / 10.0;
   }
-  doc["soc_temp"]        = round(sensorData.socTempC           * 10) / 10.0;
+  doc["soc_temp"] = round(sensorData.socTempC * 10) / 10.0;
 
-  doc["ph"]              = round(sensorData.phValue * 100) / 100.0;
+  doc["ph"] = round(sensorData.phValue * 100) / 100.0;
 
   if (sensorData.npkValid) {
-    doc["nitrogen"]   = round(sensorData.nitrogenPpm   * 10) / 10.0;
+    doc["nitrogen"] = round(sensorData.nitrogenPpm * 10) / 10.0;
     doc["phosphorus"] = round(sensorData.phosphorusPpm * 10) / 10.0;
-    doc["potassium"]  = round(sensorData.potassiumPpm  * 10) / 10.0;
+    doc["potassium"] = round(sensorData.potassiumPpm * 10) / 10.0;
   }
 
   JsonObject sys = doc.createNestedObject("sys");
-  auto sStr = [](uint8_t s) { return s == 0 ? "ok" : (s == 1 ? "warn" : "error"); };
+  auto sStr = [](uint8_t s) {
+    return s == 0 ? "ok" : (s == 1 ? "warn" : "error");
+  };
   sys["rtc"] = sStr(sensorData.stat_rtc);
   sys["npk"] = sStr(sensorData.stat_npk);
   sys["aht"] = sStr(sensorData.stat_aht);
@@ -876,7 +1015,7 @@ String buildJsonPayload() {
   sys["hdc"] = sStr(sensorData.stat_hdc);
   sys["ina"] = sStr(sensorData.stat_ina);
   char timeStr[32];
-  struct tm *ti = localtime(&sensorData.timestamp);
+  struct tm* ti = localtime(&sensorData.timestamp);
   strftime(timeStr, sizeof(timeStr), "%Y-%m-%d %H:%M:%S", ti);
   sys["rtc_time"] = timeStr;
 
