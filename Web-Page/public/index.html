@@ -7,6 +7,11 @@
   <title>Garden Monitor</title>
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&display=swap" rel="stylesheet" />
+  <!-- Evo-Calendar CSS -->
+  <link rel="stylesheet" type="text/css" href="https://cdn.jsdelivr.net/npm/evo-calendar@1.1.2/evo-calendar/css/evo-calendar.min.css"/>
+  <link rel="stylesheet" type="text/css" href="https://cdn.jsdelivr.net/npm/evo-calendar@1.1.2/evo-calendar/css/evo-calendar.midnight-blue.min.css"/>
+  <!-- Flatpickr CSS -->
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/flatpickr/dist/flatpickr.min.css">
   <link rel="stylesheet" href="style.css" />
 </head>
 
@@ -74,32 +79,104 @@
       </style>
       <div class="global-header-actions">
 
-
-
-        <div class="top-actions"
-          style="position: relative; top: 0; right: 0; padding: 0; background: none; box-shadow: none;">
-          <button class="action-btn" id="btn-water" onclick="cmdWater()">Water Plant</button>
-          <button class="action-btn" id="btn-sync-rtc" onclick="cmdSyncRTC()">Sync RTC</button>
-        </div>
-
-        <!-- Wi-Fi Status Indicator -->
-        <div class="wifi-indicator" id="wifi-indicator"
-          style=" cursor: help; display: flex; align-items: revert;position: relative;top: 0;left: 30%;padding: 0;background: none;box-shadow: none;">
-          <svg id="wifi-icon-svg" viewBox="0 0 24 24" width="24" height="24" fill="currentColor"
-            style="color: #64748b;">
-            <path
-              d="M12 3C7.95 3 4.21 4.34 1.2 6.6L3 9C5.5 7.12 8.62 6 12 6s6.5 1.12 9 3l1.8-2.4C19.79 4.34 16.05 3 12 3zm0 5c-2.46 0-4.71.84-6.49 2.23L7.3 12.6C8.61 11.58 10.23 11 12 11s3.39.58 4.7 1.6l1.79-2.37C16.71 8.84 14.46 8 12 8zm0 5c-1.12 0-2.16.36-2.98.97l2.98 3.97 2.98-3.97C14.16 13.36 13.12 13 12 13z" />
-          </svg>
-          <div class="wifi-hover-box"
-            style="position: absolute; right: 0; top: 30px; background: rgba(255,255,255,0.95); padding: 10px 14px; border-radius: 8px; box-shadow: 0 4px 12px rgba(0,0,0,0.15); display: none; white-space: nowrap; font-size: 0.85rem; border: 1px solid #e2e8f0; pointer-events: none; z-index: 100;">
-            <strong id="wifi-hover-ssid" style="color: #0ea5e9;">Offline</strong><br>
-            <span style="color: #64748b; margin-top: 4px; display: inline-block;">IP: <span id="wifi-hover-ip"
-                style="color:#333; font-weight:500;">--</span></span><br>
-            <span style="color: #64748b;">Signal: <span id="wifi-hover-rssi"
-                style="color:#333; font-weight:500;">--</span> dBm</span>
+        <!-- Grafana Style Toolbar -->
+        <div class="grafana-toolbar" id="global-time-toolbar">
+          <div class="grafana-button-group">
+            <button class="grafana-btn icon-btn" onclick="shiftGlobalTime(-1)" title="Move backward">
+              <svg viewBox="0 0 24 24" width="18" height="18"><path d="M11.46,8.29a1,1,0,0,0-1.42,0l-3,3a1,1,0,0,0,0,1.42l3,3a1,1,0,0,0,1.42,0,1,1,0,0,0,0-1.42L9.16,12l2.3-2.29A1,1,0,0,0,11.46,8.29ZM14.66,12,17,9.71a1,1,0,0,0-1.42-1.42l-3,3a1,1,0,0,0,0,1.42l3,3a1,1,0,0,0,1.42,0,1,1,0,0,0,0-1.42Z" fill="currentColor"></path></svg>
+            </button>
+            <button class="grafana-btn text-btn" id="global-date-picker-btn" onclick="toggleGrafanaPopover()">
+              <svg viewBox="0 0 24 24" class="icon-clock" width="16" height="16"><path d="M12,6a.99974.99974,0,0,0-1,1v4H9a1,1,0,0,0,0,2h3a.99974.99974,0,0,0,1-1V7A.99974.99974,0,0,0,12,6Zm0-4A10,10,0,1,0,22,12,10.01146,10.01146,0,0,0,12,2Zm0,18a8,8,0,1,1,8-8A8.00917,8.00917,0,0,1,12,20Z" fill="currentColor"></path></svg>
+              <span id="global-date-label">Last 24 hours</span>
+              <svg viewBox="0 0 24 24" class="icon-down" width="14" height="14"><path d="M17,9.17a1,1,0,0,0-1.41,0L12,12.71,8.46,9.17a1,1,0,0,0-1.41,0,1,1,0,0,0,0,1.42l4.24,4.24a1,1,0,0,0,1.42,0L17,10.59A1,1,0,0,0,17,9.17Z" fill="currentColor"></path></svg>
+            </button>
+            <button class="grafana-btn icon-btn" onclick="shiftGlobalTime(1)" title="Move forward">
+              <svg viewBox="0 0 24 24" width="18" height="18"><path d="M8.46,8.29A1,1,0,1,0,7,9.71L9.34,12,7,14.29a1,1,0,0,0,0,1.42,1,1,0,0,0,1.42,0l3-3a1,1,0,0,0,0-1.42Zm8.5,3-3-3a1,1,0,0,0-1.42,1.42L14.84,12l-2.3,2.29a1,1,0,0,0,0,1.42,1,1,0,0,0,1.42,0l3-3A1,1,0,0,0,17,11.29Z" fill="currentColor"></path></svg>
+            </button>
+            <button class="grafana-btn icon-btn" onclick="zoomOutGlobalTime()" title="Zoom out">
+              <svg viewBox="0 0 24 24" width="18" height="18"><path d="M21.71,20.29,18,16.61A9,9,0,1,0,16.61,18l3.68,3.68a1,1,0,0,0,1.42,0A1,1,0,0,0,21.71,20.29ZM11,18a7,7,0,1,1,7-7A7,7,0,0,1,11,18Zm4-8H7a1,1,0,0,0,0,2h8a1,1,0,0,0,0-2Z" fill="currentColor"></path></svg>
+            </button>
+          </div>
+          <div class="grafana-button-group refresh-picker">
+            <button class="grafana-btn text-btn" onclick="forceRefreshCharts()" title="Refresh now">
+              <svg viewBox="0 0 24 24" width="16" height="16"><path d="M19.91,15.51H15.38a1,1,0,0,0,0,2h2.4A8,8,0,0,1,4,12a1,1,0,0,0-2,0,10,10,0,0,0,16.88,7.23V21a1,1,0,0,0,2,0V16.5A1,1,0,0,0,19.91,15.51ZM12,2A10,10,0,0,0,5.12,4.77V3a1,1,0,0,0-2,0V7.5a1,1,0,0,0,1,1h4.5a1,1,0,0,0,0-2H6.22A8,8,0,0,1,20,12a1,1,0,0,0,2,0A10,10,0,0,0,12,2Z" fill="currentColor"></path></svg>
+            </button>
+            <select id="global-auto-refresh-select" class="grafana-select" onchange="updateGlobalAutoRefresh()">
+              <option value="0">Auto</option>
+              <option value="30000">30s</option>
+              <option value="60000">1m</option>
+              <option value="120000">2m</option>
+              <option value="300000">5m</option>
+              <option value="900000">15m</option>
+            </select>
           </div>
         </div>
 
+        <!-- GRAFANA TIME PICKER POPOVER -->
+        <div id="grafana-time-picker-popover" class="grafana-popover" style="display: none;">
+          <div class="grafana-popover-content">
+            <div class="grafana-popover-left">
+              <h3 style="margin-top:0; font-size:14px; font-weight:500; margin-bottom:15px;">Absolute time range</h3>
+              <div class="grafana-input-group">
+                <label>From</label>
+                <input type="text" id="grafana-from-input" class="grafana-time-input" placeholder="now-24h">
+              </div>
+              <div class="grafana-input-group">
+                <label>To</label>
+                <input type="text" id="grafana-to-input" class="grafana-time-input" placeholder="now">
+              </div>
+              <button class="grafana-apply-btn" onclick="applyGrafanaAbsoluteTime()">Apply time range</button>
+              <div class="grafana-popover-help">
+                It looks like you haven't used this time picker before. As soon as you enter some time intervals, recently used intervals will appear here.
+              </div>
+            </div>
+            <div class="grafana-popover-right">
+              <div class="grafana-quick-search">
+                <svg viewBox="0 0 24 24" width="14" height="14" fill="#a3a3a3"><path d="M21.71,20.29,18,16.61A9,9,0,1,0,16.61,18l3.68,3.68a1,1,0,0,0,1.42,0A1,1,0,0,0,21.71,20.29ZM11,18a7,7,0,1,1,7-7A7,7,0,0,1,11,18Z"></path></svg>
+                <input type="text" placeholder="Search quick ranges">
+              </div>
+              <ul class="grafana-quick-ranges">
+                <li onclick="applyGrafanaQuickRange('5m', 'Last 5 minutes')">Last 5 minutes</li>
+                <li onclick="applyGrafanaQuickRange('15m', 'Last 15 minutes')">Last 15 minutes</li>
+                <li onclick="applyGrafanaQuickRange('30m', 'Last 30 minutes')">Last 30 minutes</li>
+                <li onclick="applyGrafanaQuickRange('1h', 'Last 1 hour')">Last 1 hour</li>
+                <li onclick="applyGrafanaQuickRange('3h', 'Last 3 hours')">Last 3 hours</li>
+                <li onclick="applyGrafanaQuickRange('6h', 'Last 6 hours')">Last 6 hours</li>
+                <li onclick="applyGrafanaQuickRange('12h', 'Last 12 hours')">Last 12 hours</li>
+                <li onclick="applyGrafanaQuickRange('24h', 'Last 24 hours')" class="active" id="qr-24h">Last 24 hours</li>
+                <li onclick="applyGrafanaQuickRange('2d', 'Last 2 days')">Last 2 days</li>
+                <li onclick="applyGrafanaQuickRange('7d', 'Last 7 days')">Last 7 days</li>
+                <li onclick="applyGrafanaQuickRange('30d', 'Last 30 days')">Last 30 days</li>
+                <li onclick="applyGrafanaQuickRange('90d', 'Last 90 days')">Last 90 days</li>
+                <li onclick="applyGrafanaQuickRange('6M', 'Last 6 months')">Last 6 months</li>
+                <li onclick="applyGrafanaQuickRange('1y', 'Last 1 year')">Last 1 year</li>
+              </ul>
+            </div>
+          </div>
+        </div>
+
+        <div class="top-actions">
+          <button class="action-btn" id="btn-water" onclick="cmdWater()">
+            <svg viewBox="0 0 24 24" width="16" height="16" fill="currentColor"><path d="M12 21.5c-3.03 0-5.5-2.47-5.5-5.5 0-2.34 1.95-5.43 5.5-10.15 3.55 4.72 5.5 7.81 5.5 10.15 0 3.03-2.47 5.5-5.5 5.5z"/></svg>
+            Water Plant
+          </button>
+          <button class="action-btn" id="btn-sync-rtc" onclick="cmdSyncRTC()">
+            <svg viewBox="0 0 24 24" width="16" height="16" fill="currentColor"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm1 15h-2v-6h2v6zm0-8h-2V7h2v2z"/></svg>
+            Sync RTC
+          </button>
+        </div>
+
+        <!-- Wi-Fi Status Indicator -->
+        <div class="wifi-indicator" id="wifi-indicator" title="Wi-Fi Status">
+          <svg id="wifi-icon-svg" viewBox="0 0 24 24" width="22" height="22" fill="currentColor" style="color: #64748b;">
+            <path d="M12 3C7.95 3 4.21 4.34 1.2 6.6L3 9C5.5 7.12 8.62 6 12 6s6.5 1.12 9 3l1.8-2.4C19.79 4.34 16.05 3 12 3zm0 5c-2.46 0-4.71.84-6.49 2.23L7.3 12.6C8.61 11.58 10.23 11 12 11s3.39.58 4.7 1.6l1.79-2.37C16.71 8.84 14.46 8 12 8zm0 5c-1.12 0-2.16.36-2.98.97l2.98 3.97 2.98-3.97C14.16 13.36 13.12 13 12 13z" />
+          </svg>
+          <div class="wifi-hover-box">
+            <strong id="wifi-hover-ssid" style="color: #0ea5e9;">Offline</strong><br>
+            <span style="color: #64748b; margin-top: 4px; display: inline-block;">IP: <span id="wifi-hover-ip" style="color:#333; font-weight:500;">--</span></span><br>
+            <span style="color: #64748b;">Signal: <span id="wifi-hover-rssi" style="color:#333; font-weight:500;">--</span> dBm</span>
+          </div>
+        </div>
 
       </div>
 
@@ -405,12 +482,6 @@
               <option value="potassium">Potassium (K)</option>
               <option value="ph">Soil PH</option>
             </select>
-            <div class="neo-tabs" id="hist-period-tabs">
-              <button class="neo-tab active" onclick="setHistPeriod('hourly',this)">Hourly</button>
-              <button class="neo-tab" onclick="setHistPeriod('daily',this)">Daily</button>
-              <button class="neo-tab" onclick="setHistPeriod('weekly',this)">Weekly</button>
-              <button class="neo-tab" onclick="setHistPeriod('monthly',this)">Monthly</button>
-            </div>
           </div>
           <div class="chart-box">
             <canvas id="hist-chart"></canvas>
@@ -422,10 +493,10 @@
       <section class="page" id="page-watering">
         <div class="scroll-container">
           <div class="header-text">
-            <h1>Watering Logs</h1>
+            <h1>System & Watering Events</h1>
           </div>
-          <div id="watering-logs-container" style="display: flex; flex-direction: column; gap: 10px; margin-top: 20px;">
-            <div style="text-align:center; padding: 20px; color: var(--text-muted);">Loading logs...</div>
+          <div id="calendar-container" style="margin-top: 20px;">
+            <div id="calendar"></div>
           </div>
         </div>
       </section>
@@ -442,11 +513,8 @@
       </div>
       <div class="modal-content">
         <div class="chart-section" id="modal-chart-section">
-          <div class="neo-tabs modal-tabs">
-            <button class="neo-tab" onclick="setModalPeriod('monthly',this)">Monthly</button>
-            <button class="neo-tab" onclick="setModalPeriod('weekly',this)">Weekly</button>
-            <button class="neo-tab" onclick="setModalPeriod('daily',this)">Daily</button>
-            <button class="neo-tab active" onclick="setModalPeriod('hourly',this)">Hourly</button>
+          <div style="margin-bottom:15px; display:flex; gap:10px; flex-wrap:wrap;">
+            <!-- Modal chart now controlled by global Grafana-style time picker -->
           </div>
           <div class="chart-box" style="height:250px; margin-bottom: 15px;">
             <canvas id="modal-chart"></canvas>
@@ -515,6 +583,9 @@
   </div>
 
   <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.3/dist/chart.umd.min.js"></script>
+  <script src="https://code.jquery.com/jquery-3.6.0.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/evo-calendar@1.1.2/evo-calendar/js/evo-calendar.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/flatpickr"></script>
   <script src="app.js"></script>
 </body>
 

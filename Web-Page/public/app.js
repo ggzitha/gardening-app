@@ -16,9 +16,9 @@ function connectWS() {
       if (msg.type === 'sensor_update') {
         latestData = msg.data;
         updateDashboard(msg.data);
-      } else if (msg.type === 'watering_log') {
+      } else if (msg.type === 'watering_log' || msg.type === 'system_event') {
         if (document.getElementById('page-watering')?.classList.contains('active')) {
-          loadWateringLogs();
+          fetchCalendarEvents();
         }
       }
     } catch { }
@@ -252,54 +252,133 @@ function showToast(message, type = 'success', durationMs = 3500) {
   }, durationMs);
 }
 
-// ── Watering Logs ─────────────────────────────────────────
-async function loadWateringLogs() {
-  const c = document.getElementById('watering-logs-container');
-  if (!c) return;
+// ── Evo-Calendar (Logs) ───────────────────────────────────
+function loadWateringLogs() {
+  fetchCalendarEvents();
+}
+
+async function fetchCalendarEvents() {
   try {
-    const r = await fetch('/api/watering-events');
-    if (!r.ok) throw new Error('Failed to fetch');
-    const data = await r.json();
-    if (!data.length) {
-      c.innerHTML = '<div style="text-align:center; padding: 20px; color: var(--text-muted);">No watering logs found.</div>';
-      return;
+    const res = await fetch('/api/calendar-events');
+    const allEvents = await res.json();
+    
+    if (!Array.isArray(allEvents)) {
+        console.error("Failed to load events. Backend returned:", allEvents);
+        return;
     }
     
-    let html = '';
-    let lastDate = '';
-    data.forEach(log => {
-      const dt = new Date(log.event_at);
-      const dateStr = dt.toLocaleDateString(undefined, { weekday: 'short', year: 'numeric', month: 'long', day: 'numeric' });
-      if (dateStr !== lastDate) {
-        if (lastDate !== '') html += `</div></div>`;
-        html += `<div style="background: rgba(255,255,255,0.7); backdrop-filter: blur(10px); border-radius: 12px; margin-bottom: 15px; border: 1px solid #e2e8f0; overflow: hidden; box-shadow: 0 4px 6px rgba(0,0,0,0.02);">
-          <div style="background: #bae6fd; padding: 10px 15px; font-weight: 600; color: #0369a1; border-bottom: 1px solid #e2e8f0;">${dateStr}</div>
-          <div style="padding: 10px;">`;
-        lastDate = dateStr;
-      }
-      
-      const timeStr = dt.toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' });
-      const typeStr = log.is_manual ? 'Manual' : 'Auto';
-      const typeColor = log.is_manual ? '#8b5cf6' : '#10b981';
-      
-      html += `
-        <div style="display: flex; justify-content: space-between; align-items: center; padding: 12px 10px; border-bottom: 1px solid #f1f5f9;">
-          <div>
-            <strong style="font-size: 1.1rem; color: #334155;">${timeStr}</strong>
-            <span style="background: ${typeColor}15; color: ${typeColor}; padding: 3px 8px; border-radius: 20px; font-size: 0.75rem; font-weight: 600; margin-left: 8px;">${typeStr}</span>
+    // Store globally for the custom renderer
+    window.fullCalendarEvents = allEvents;
+    
+    // Deduplicate so Evo-Calendar only draws ONE dot per category per day
+    const dotsMap = {};
+    const summaryEvents = [];
+    allEvents.forEach(e => {
+        const key = `${e.date}_${e.type}`;
+        if (!dotsMap[key]) {
+            dotsMap[key] = true;
+            summaryEvents.push(e);
+        }
+    });
+    
+    // Destroy previous instance if it exists to refresh events safely
+    if ($("#calendar").hasClass("calendar-initialized")) {
+        try { $("#calendar").evoCalendar('destroy'); } catch (e) {}
+        $("#calendar").removeClass("calendar-initialized");
+    }
+    
+    $("#calendar").evoCalendar({
+      theme: 'Midnight Blue',
+      format: 'mm/dd/yyyy',
+      titleFormat: 'MM yyyy',
+      eventHeaderFormat: 'MM d, yyyy',
+      calendarEvents: summaryEvents
+    });
+    $("#calendar").addClass("calendar-initialized");
+    
+    // Bind to Evo-Calendar events to override the UI
+    $("#calendar").on('selectDate', function() {
+        renderCustomEventList();
+    });
+    $("#calendar").on('selectMonth', function() {
+        renderCustomEventList();
+    });
+    
+    renderCustomEventList();
+  } catch(e) { console.error("Evo-Calendar fetch error:", e); }
+}
+
+function renderCustomEventList() {
+    const selectedDate = $('#calendar').evoCalendar('getActiveDate'); // e.g. "05/27/2026"
+    const container = $('.calendar-events'); // the default evo-calendar container
+    
+    // Group events
+    const groups = {
+        error: { title: 'Error Logs', color: '#ef4444', events: [] },
+        warning: { title: 'Warning Logs', color: '#facc15', events: [] },
+        info: { title: 'Info Logs', color: '#9333ea', events: [] },
+        watering: { title: 'Watering Logs', color: '#0ea5e9', events: [] }
+    };
+    
+    const fullEvents = window.fullCalendarEvents || [];
+    let hasEvents = false;
+    
+    fullEvents.forEach(e => {
+        if (e.date === selectedDate && groups[e.type]) {
+            groups[e.type].events.push(e);
+            hasEvents = true;
+        }
+    });
+
+    let html = '<div class="calendar-events-custom">';
+    
+    Object.keys(groups).forEach(key => {
+        const group = groups[key];
+        if (group.events.length === 0) return;
+        hasEvents = true;
+        
+        // Build Accordion
+        html += `
+        <div class="event-accordion expanded">
+          <div class="event-accordion-header" onclick="this.parentElement.classList.toggle('expanded')">
+            <div class="dot" style="background-color: ${group.color}"></div>
+            <div class="title">${group.title}</div>
+            <div class="chevron">
+               <svg viewBox="0 0 24 24" width="16" height="16" fill="currentColor"><path d="M8.59,16.59L13.17,12,8.59,7.41,10,6l6,6-6,6Z"/></svg>
+            </div>
           </div>
-          <div style="text-align: right;">
-            <div style="color: #64748b; font-size: 0.85rem;">Duration: <strong>${log.duration_sec}s</strong></div>
-            <div style="color: #0ea5e9; font-weight: 600; font-size: 0.9rem;">${Number(log.start_moist).toFixed(1)}% ➔ ${Number(log.end_moist).toFixed(1)}%</div>
+          <div class="event-accordion-body">
+        `;
+        
+        group.events.forEach(e => {
+            html += `
+            <div class="timeline-item">
+              <div class="timeline-time">${e.time || ''}</div>
+              <div class="timeline-divider"><div class="timeline-dot"></div></div>
+              <div class="timeline-content">
+                <div class="timeline-title">${e.name}</div>
+                <div class="timeline-desc">${e.description}</div>
+              </div>
+            </div>
+            `;
+        });
+        
+        html += `
           </div>
         </div>
-      `;
+        `;
     });
-    html += `</div></div>`;
-    c.innerHTML = html;
-  } catch(e) {
-    c.innerHTML = `<div style="text-align:center; padding: 20px; color: #ef4444;">Error: ${e.message}</div>`;
-  }
+    
+    if (!hasEvents) {
+        html += `<div style="text-align:center; padding:20px; color:#999; font-size:14px;">No events for this date.</div>`;
+    }
+    
+    html += '</div>';
+    
+    // Evo calendar re-renders .calendar-events natively so we overwrite it shortly after
+    setTimeout(() => {
+        container.html(html);
+    }, 50);
 }
 
 // ── Watering Control ──────────────────────────────────────
@@ -388,11 +467,14 @@ async function confirmPurgeDB() {
 
 async function analyzeRainLikelihood() {
   try {
-    const [presRes, curRes] = await Promise.all([
-      fetch('/api/history/int_pres?period=hourly'),
-      fetch('/api/history/current_ma?period=hourly')
-    ]);
+    const presRes = await fetch(`/api/history/int_pres?period=hourly`);
     const presRows = await presRes.json();
+    if (!Array.isArray(presRows)) {
+        console.error("Failed to fetch pressure data:", presRows);
+        return;
+    }
+    const pressures = presRows.map(r => parseFloat(r.value));
+    const curRes = await fetch('/api/history/current_ma?period=hourly');
     const curRows = await curRes.json();
 
     if (!presRows || presRows.length < 5) return;
@@ -433,7 +515,6 @@ async function analyzeRainLikelihood() {
 
 // ── Modal ─────────────────────────────────────────────────
 let currentModal = null;
-let modalPeriod = 'hourly';
 let modalChart = null;
 let modalChart2 = null;
 let lastModalChartLoad = 0;  // timestamp ms — debounce auto-refresh
@@ -489,18 +570,15 @@ const GAUGE_KEYS = {
 
 function openModal(type) {
   currentModal = type;
-  modalPeriod = 'hourly';
   const cfg = MODAL_CONFIG[type];
   if (!cfg) return;
 
   document.getElementById('modal-title').textContent = cfg.title;
-  document.querySelectorAll('.modal-tabs .neo-tab').forEach(t => t.classList.remove('active'));
-  document.querySelector('.modal-tabs .neo-tab:last-child').classList.add('active');
 
   buildGauges(type);
   document.getElementById('modal-overlay').classList.add('open');
   lastModalChartLoad = 0;  // force a fresh load on open
-  loadModalChart(type, modalPeriod);
+  loadModalChart(type);
 }
 
 function closeModal(e) {
@@ -511,17 +589,7 @@ function closeModal(e) {
   if (modalChart2) { modalChart2.destroy(); modalChart2 = null; }
 }
 
-function setModalPeriod(period, btn) {
-  modalPeriod = period;
-  document.querySelectorAll('.modal-tabs .neo-tab').forEach(t => t.classList.remove('active'));
-  btn.classList.add('active');
-  if (currentModal) {
-    lastModalChartLoad = 0;  // user explicitly switched tab — force immediate reload
-    loadModalChart(currentModal, period);
-  }
-}
-
-async function loadModalChart(type, period) {
+async function loadModalChart(type) {
   const cfg = MODAL_CONFIG[type];
   if (!cfg) return;
 
@@ -535,7 +603,13 @@ async function loadModalChart(type, period) {
   const rawResults = await Promise.all(
     cfg.sensors.map(async (s) => {
       try {
-        const r = await fetch(`/api/history/${s}?period=${period}`);
+        let url = `/api/history/${s}`;
+        if (globalStart && globalEnd) {
+            url += `?start=${Math.floor(globalStart.getTime()/1000)}&end=${Math.floor(globalEnd.getTime()/1000)}`;
+        } else {
+            url += `?period=hourly`;
+        }
+        const r = await fetch(url);
         const rows = await r.json();
         return Array.isArray(rows) ? rows : [];
       } catch { return []; }
@@ -715,21 +789,151 @@ function drawGauge(canvas, value, max, unit, color) {
   ctx.textAlign = 'center'; ctx.textBaseline = 'middle'; ctx.fillText(display, cx, cy);
 }
 
+// ── Global Date & Refresh Controls ─────────────────────────
+let globalStart = null;
+let globalEnd = null;
+let globalAutoRefreshTimer = null;
+
+function updateGlobalAutoRefresh() {
+  const select = document.getElementById('global-auto-refresh-select');
+  const ms = parseInt(select.value, 10);
+  if (globalAutoRefreshTimer) clearInterval(globalAutoRefreshTimer);
+  
+  // Post interval configuration to backend API (which sends MQTT to ESP32)
+  let val = select.value === "0" ? "auto" : parseInt(select.value, 10);
+  fetch('/api/command', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ cmd: 'set_interval', val: val })
+  }).catch(e => console.error("Auto refresh update error", e));
+
+  if (ms > 0) {
+      globalAutoRefreshTimer = setInterval(() => {
+          forceRefreshCharts();
+      }, ms);
+  }
+}
+
+function forceRefreshCharts() {
+  if (document.getElementById('page-dashboard').classList.contains('active')) {
+      loadHistoryPage();
+  }
+  if (currentModal && document.getElementById('modal-overlay').classList.contains('open')) {
+      lastModalChartLoad = 0;
+      loadModalChart(currentModal);
+  }
+}
+
+function shiftGlobalTime(dir) {
+  if (!globalStart || !globalEnd) {
+      globalEnd = new Date();
+      globalStart = new Date(globalEnd.getTime() - 24 * 3600 * 1000);
+  }
+  const diff = globalEnd.getTime() - globalStart.getTime();
+  globalStart = new Date(globalStart.getTime() + dir * diff);
+  globalEnd = new Date(globalEnd.getTime() + dir * diff);
+  updateGlobalDateLabel();
+  forceRefreshCharts();
+}
+
+function zoomOutGlobalTime() {
+  if (!globalStart || !globalEnd) {
+      globalEnd = new Date();
+      globalStart = new Date(globalEnd.getTime() - 24 * 3600 * 1000);
+  }
+  const diff = globalEnd.getTime() - globalStart.getTime();
+  globalStart = new Date(globalStart.getTime() - diff/2);
+  globalEnd = new Date(globalEnd.getTime() + diff/2);
+  updateGlobalDateLabel();
+  forceRefreshCharts();
+}
+
+function updateGlobalDateLabel() {
+  const lbl = document.getElementById('global-date-label');
+  if (!globalStart || !globalEnd) {
+    lbl.textContent = 'Last 24 hours';
+    sessionStorage.removeItem('globalStart');
+    sessionStorage.removeItem('globalEnd');
+    return;
+  }
+  const opts = { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' };
+  lbl.textContent = `${globalStart.toLocaleString(undefined, opts)} - ${globalEnd.toLocaleString(undefined, opts)}`;
+  
+  // Save to sessionStorage so it persists across page navigations
+  sessionStorage.setItem('globalStart', globalStart.getTime());
+  sessionStorage.setItem('globalEnd', globalEnd.getTime());
+}
+
+// ── Grafana Popover Logic ─────────────────────────
+function parseGrafanaTime(str) {
+  if (str === 'now') return new Date();
+  const match = str.match(/^now-(\d+)([mhdMy])$/);
+  if (!match) {
+    // fallback
+    const d = new Date(str);
+    return isNaN(d.getTime()) ? new Date() : d;
+  }
+  const val = parseInt(match[1], 10);
+  const unit = match[2];
+  const d = new Date();
+  if (unit === 'm') d.setMinutes(d.getMinutes() - val);
+  if (unit === 'h') d.setHours(d.getHours() - val);
+  if (unit === 'd') d.setDate(d.getDate() - val);
+  if (unit === 'M') d.setMonth(d.getMonth() - val);
+  if (unit === 'y') d.setFullYear(d.getFullYear() - val);
+  return d;
+}
+
+function toggleGrafanaPopover() {
+  const popover = document.getElementById('grafana-time-picker-popover');
+  popover.style.display = popover.style.display === 'none' ? 'block' : 'none';
+}
+
+function applyGrafanaQuickRange(val, label) {
+  document.getElementById('grafana-from-input').value = `now-${val}`;
+  document.getElementById('grafana-to-input').value = 'now';
+  
+  // Update active state in list
+  document.querySelectorAll('.grafana-quick-ranges li').forEach(el => el.classList.remove('active'));
+  if (event && event.target.tagName === 'LI') {
+    event.target.classList.add('active');
+  }
+
+  globalStart = parseGrafanaTime(`now-${val}`);
+  globalEnd = new Date();
+  
+  updateGlobalDateLabel();
+  document.getElementById('grafana-time-picker-popover').style.display = 'none';
+  forceRefreshCharts();
+}
+
+function applyGrafanaAbsoluteTime() {
+  const fromStr = document.getElementById('grafana-from-input').value;
+  const toStr = document.getElementById('grafana-to-input').value;
+  
+  globalStart = parseGrafanaTime(fromStr);
+  globalEnd = parseGrafanaTime(toStr);
+  
+  updateGlobalDateLabel();
+  document.getElementById('grafana-time-picker-popover').style.display = 'none';
+  forceRefreshCharts();
+}
+
 // ── History Page Chart ────────────────────────────────────
 let histChart = null;
-let histPeriod = 'hourly';
-
-function setHistPeriod(p, btn) {
-  histPeriod = p;
-  document.querySelectorAll('#hist-period-tabs .neo-tab').forEach(t => t.classList.remove('active'));
-  btn.classList.add('active');
-  loadHistoryPage();
-}
 
 async function loadHistoryPage() {
   const sensor = document.getElementById('hist-sensor').value;
+  let url = `/api/history/${sensor}`;
+  
+  if (globalStart && globalEnd) {
+      url += `?start=${Math.floor(globalStart.getTime()/1000)}&end=${Math.floor(globalEnd.getTime()/1000)}`;
+  } else {
+      url += `?period=daily`; // fallback
+  }
+  
   try {
-    const r = await fetch(`/api/history/${sensor}?period=${histPeriod}`);
+    const r = await fetch(url);
     const rows = await r.json();
     if (!Array.isArray(rows)) return;
 
@@ -765,8 +969,29 @@ async function loadHistoryPage() {
 
 // ── Init ──────────────────────────────────────────────────
 document.addEventListener('DOMContentLoaded', () => {
+  // Restore global date from sessionStorage if exists
+  const savedStart = sessionStorage.getItem('globalStart');
+  const savedEnd = sessionStorage.getItem('globalEnd');
+  if (savedStart && savedEnd) {
+      globalStart = new Date(parseInt(savedStart, 10));
+      globalEnd = new Date(parseInt(savedEnd, 10));
+      updateGlobalDateLabel();
+  }
+
   fetchLatest();
   connectWS();
+  
+  // Init Flatpickr for Absolute Time inputs inside Popover
+  flatpickr("#grafana-from-input", {
+    enableTime: true,
+    dateFormat: "Y-m-d H:i",
+    allowInput: true
+  });
+  flatpickr("#grafana-to-input", {
+    enableTime: true,
+    dateFormat: "Y-m-d H:i",
+    allowInput: true
+  });
   
   // Weather analysis every 5 minutes
   setTimeout(analyzeRainLikelihood, 10000); // initial run after 10s
@@ -776,6 +1001,18 @@ document.addEventListener('DOMContentLoaded', () => {
     if (e.key === 'Escape') {
       if (currentModal) closeModal();
       closeSysModal();
+      document.getElementById('grafana-time-picker-popover').style.display = 'none';
+    }
+  });
+
+  document.addEventListener('click', e => {
+    const popover = document.getElementById('grafana-time-picker-popover');
+    const btn = document.getElementById('global-date-picker-btn');
+    if (popover && popover.style.display === 'block') {
+      // Close popover if clicked outside of popover and not on the toggle button
+      if (!popover.contains(e.target) && !btn.contains(e.target) && !e.target.closest('.flatpickr-calendar')) {
+        popover.style.display = 'none';
+      }
     }
   });
 });
@@ -800,10 +1037,23 @@ function updateTimeAgo() {
 
   const dot = document.getElementById('ws-dot');
   if (dot) {
-    if (diffSec < 300) { dot.style.background = '#22c55e'; dot.style.boxShadow = '0 0 8px #22c55e'; } // <5 min
-    else if (diffSec < 3600) { dot.style.background = '#facc15'; dot.style.boxShadow = '0 0 8px #facc15'; } // <1 hr
-    else if (diffSec < 86400) { dot.style.background = '#ef4444'; dot.style.boxShadow = '0 0 8px #ef4444'; } // <1 day
-    else { dot.style.background = '#000'; dot.style.boxShadow = '0 0 8px #000'; } // >1 day
+    // Dynamically calculate the "green" threshold based on the selected interval
+    const select = document.getElementById('global-auto-refresh-select');
+    const valMs = parseInt(select.value, 10);
+    
+    let expectedMaxDelaySec = 150; // default 2m + 30s buffer
+    
+    if (valMs === 0) {
+        // Auto mode can be up to 10 mins (low battery)
+        expectedMaxDelaySec = 660; // 10m + 1m buffer
+    } else if (valMs >= 120000) {
+        expectedMaxDelaySec = (valMs / 1000) + 60; // Selected interval + 1m buffer
+    }
+
+    if (diffSec <= expectedMaxDelaySec) { dot.style.background = '#22c55e'; dot.style.boxShadow = '0 0 8px #22c55e'; } // Green
+    else if (diffSec < 3600) { dot.style.background = '#facc15'; dot.style.boxShadow = '0 0 8px #facc15'; } // Yellow (<1 hr)
+    else if (diffSec < 86400) { dot.style.background = '#ef4444'; dot.style.boxShadow = '0 0 8px #ef4444'; } // Red (<1 day)
+    else { dot.style.background = '#000'; dot.style.boxShadow = '0 0 8px #000'; } // Black (>1 day)
   }
 }
 setInterval(updateTimeAgo, 1000);

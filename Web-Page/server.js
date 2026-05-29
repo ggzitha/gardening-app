@@ -52,6 +52,68 @@ async function initDB() {
   // Test connection
   const conn = await dbPool.getConnection();
   console.log('✅ MariaDB connected');
+  
+  // Auto-create tables in case init.sql fails due to Docker permission issues
+  try {
+    await conn.query(`
+      CREATE TABLE IF NOT EXISTS sensor_readings (
+        id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+        recorded_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        soil1_raw SMALLINT UNSIGNED,
+        soil2_raw SMALLINT UNSIGNED,
+        soil3_raw SMALLINT UNSIGNED,
+        soil_moisture FLOAT,
+        soil_temp FLOAT,
+        ambient_temp FLOAT,
+        humidity FLOAT,
+        uv_index FLOAT,
+        rain_raw SMALLINT UNSIGNED,
+        is_raining TINYINT(1) DEFAULT 0,
+        nitrogen FLOAT,
+        phosphorus FLOAT,
+        potassium FLOAT,
+        ph FLOAT,
+        battery_v FLOAT,
+        current_ma FLOAT,
+        power_mw FLOAT,
+        is_charging TINYINT(1) DEFAULT 0,
+        env_temp FLOAT,
+        env_hum FLOAT,
+        int_temp FLOAT,
+        int_pres FLOAT,
+        soc_temp FLOAT,
+        valve_open TINYINT(1) DEFAULT 0,
+        raw_json JSON,
+        INDEX idx_recorded_at (recorded_at)
+      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+    `);
+    
+    await conn.query(`
+      CREATE TABLE IF NOT EXISTS events (
+        id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+        event_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        event_type VARCHAR(64),
+        detail TEXT,
+        INDEX idx_event_at (event_at)
+      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+    `);
+    
+    await conn.query(`
+      CREATE TABLE IF NOT EXISTS watering_logs (
+        id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+        event_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        duration_sec INT UNSIGNED,
+        start_moist FLOAT,
+        end_moist FLOAT,
+        is_manual TINYINT(1) DEFAULT 0,
+        INDEX idx_event_at (event_at)
+      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+    `);
+    console.log('✅ DB Tables verified');
+  } catch (err) {
+    console.error('Table creation error:', err.message);
+  }
+  
   conn.release();
 }
 
@@ -81,6 +143,20 @@ function initMQTT() {
         const msg = JSON.stringify({ type: 'watering_log', data });
         wss.clients.forEach(c => { if (c.readyState === 1) c.send(msg); });
       } catch (e) { console.error('DB log error:', e.message); }
+      return;
+    }
+    
+    if (data.type === 'system_event') {
+      try {
+        for (const eventMsg of data.events) {
+            await dbPool.execute(
+              'INSERT INTO events (event_type, detail) VALUES (?, ?)',
+              ['SYSTEM_ALERT', eventMsg]
+            );
+        }
+        const msg = JSON.stringify({ type: 'system_event', data });
+        wss.clients.forEach(c => { if (c.readyState === 1) c.send(msg); });
+      } catch (e) { console.error('DB event log error:', e.message); }
       return;
     }
 
@@ -149,10 +225,10 @@ app.get('/api/latest', async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// History: period = daily | weekly | monthly
+// History: period = daily | weekly | monthly or start/end
 app.get('/api/history/:sensor', async (req, res) => {
   const { sensor } = req.params;
-  const { period = 'daily' } = req.query;
+  const { period = 'daily', start, end } = req.query;
 
   const allowed = [
     'soil_moisture', 'soil1_pct', 'soil2_pct', 'soil3_pct', 'soil_temp', 'ambient_temp', 'humidity',
@@ -163,33 +239,47 @@ app.get('/api/history/:sensor', async (req, res) => {
   ];
   if (!allowed.includes(sensor)) return res.status(400).json({ error: 'Invalid sensor' });
 
-  let interval, groupBy, limitClause;
-  switch (period) {
-    case 'monthly':
-      // Last 30 days, 1 average per day → ~30 points
-      interval = '30 DAY';
-      groupBy = `DATE_FORMAT(recorded_at, '%b-%d')`;
-      limitClause = 'LIMIT 30';
-      break;
-    case 'weekly':
-      // Last 7 days, 1 average per day → 7 points
-      interval = '7 DAY';
-      groupBy = `DATE_FORMAT(recorded_at, '%b-%d')`;
-      limitClause = 'LIMIT 7';
-      break;
-    case 'daily':
-      // Last 24 hours, 1 average per hour → 24 points
-      interval = '24 HOUR';
-      groupBy = `DATE_FORMAT(recorded_at, '%b-%d %H:00')`;
-      limitClause = 'LIMIT 24';
-      break;
-    case 'hourly':
-    default:
-      // Last 60 minutes, 1 row per minute → exactly 60 points
-      interval = '60 MINUTE';
-      groupBy = `DATE_FORMAT(recorded_at, '%H:%i')`;
-      limitClause = 'LIMIT 60';
-      break;
+  let groupBy, limitClause, timeFilter;
+  
+  if (start && end) {
+      // Dynamic date range
+      timeFilter = `recorded_at >= FROM_UNIXTIME(${dbPool.escape(start)}) AND recorded_at <= FROM_UNIXTIME(${dbPool.escape(end)})`;
+      limitClause = 'LIMIT 1000'; // Prevent huge payloads
+      
+      const diffMs = (end - start) * 1000;
+      if (diffMs > 30 * 24 * 60 * 60 * 1000) { // > 30 days
+          groupBy = `DATE_FORMAT(recorded_at, '%Y-%b-%d')`;
+      } else if (diffMs > 7 * 24 * 60 * 60 * 1000) { // > 7 days
+          groupBy = `DATE_FORMAT(recorded_at, '%b-%d %H:00')`;
+      } else if (diffMs > 24 * 60 * 60 * 1000) { // > 1 day
+          groupBy = `DATE_FORMAT(recorded_at, '%b-%d %H:00')`;
+      } else { // < 1 day
+          groupBy = `DATE_FORMAT(recorded_at, '%H:%i')`;
+      }
+  } else {
+      switch (period) {
+        case 'monthly':
+          timeFilter = 'recorded_at >= NOW() - INTERVAL 30 DAY AND recorded_at <= NOW()';
+          groupBy = `DATE_FORMAT(recorded_at, '%b-%d')`;
+          limitClause = 'LIMIT 30';
+          break;
+        case 'weekly':
+          timeFilter = 'recorded_at >= NOW() - INTERVAL 7 DAY AND recorded_at <= NOW()';
+          groupBy = `DATE_FORMAT(recorded_at, '%b-%d')`;
+          limitClause = 'LIMIT 7';
+          break;
+        case 'daily':
+          timeFilter = 'recorded_at >= NOW() - INTERVAL 24 HOUR AND recorded_at <= NOW()';
+          groupBy = `DATE_FORMAT(recorded_at, '%b-%d %H:00')`;
+          limitClause = 'LIMIT 24';
+          break;
+        case 'hourly':
+        default:
+          timeFilter = 'recorded_at >= NOW() - INTERVAL 60 MINUTE AND recorded_at <= NOW()';
+          groupBy = `DATE_FORMAT(recorded_at, '%H:%i')`;
+          limitClause = 'LIMIT 60';
+          break;
+      }
   }
 
   let sensorCol = `\`${sensor}\``;
@@ -220,8 +310,7 @@ app.get('/api/history/:sensor', async (req, res) => {
         ROUND(MIN(${sensorCol}), 2) AS min_val,
         ROUND(MAX(${sensorCol}), 2) AS max_val
       FROM sensor_readings
-      WHERE recorded_at >= NOW() - INTERVAL ${interval}
-        AND recorded_at <= NOW()
+      WHERE ${timeFilter}
         AND ${notNullCheck}
       GROUP BY ${groupBy}
       ORDER BY MIN(recorded_at) ASC
@@ -264,6 +353,105 @@ app.get('/api/watering-events', async (req, res) => {
   try {
     const [rows] = await dbPool.query('SELECT * FROM watering_logs ORDER BY event_at DESC LIMIT 200');
     res.json(rows);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Fetch all events for Calendar
+app.get('/api/calendar-events', async (req, res) => {
+  try {
+    // Get watering logs
+    const [waterRows] = await dbPool.query('SELECT * FROM watering_logs ORDER BY event_at DESC LIMIT 1000');
+    // Get system events
+    const [sysRows] = await dbPool.query('SELECT * FROM events ORDER BY event_at DESC LIMIT 1000');
+    
+    // Format for Evo-Calendar
+    const calendarEvents = [];
+    
+    waterRows.forEach(row => {
+        const d = new Date(row.event_at);
+        const mm = String(d.getMonth() + 1).padStart(2, '0');
+        const dd = String(d.getDate()).padStart(2, '0');
+        const yyyy = d.getFullYear();
+
+        const hh24 = d.getHours();
+        const min = String(d.getMinutes()).padStart(2, '0');
+        const ampm = hh24 >= 12 ? 'PM' : 'AM';
+        const hh12 = hh24 % 12 || 12;
+        const timeStr = `${String(hh12).padStart(2, '0')}:${min} ${ampm}`;
+
+        calendarEvents.push({
+            id: `w_${row.id}`,
+            name: "Watering Plant",
+            date: `${mm}/${dd}/${yyyy}`,
+            time: timeStr,
+            type: "watering",
+            description: `${row.is_manual ? "Manual" : "Auto"} Trigger From ${row.start_moist}% -> ${row.end_moist}%`,
+            color: "#0ea5e9" // Sky blue
+        });
+    });
+    
+    sysRows.forEach(row => {
+        let type = "error";
+        let color = "#ef4444"; // Red for errors
+        let name = "Error Logs";
+        let detail = row.detail || row.event_type;
+        
+        // Try parsing detail to see if it's a JSON command (Info)
+        try {
+            if (detail.startsWith('{') && detail.includes('cmd')) {
+                const jsonObj = JSON.parse(detail);
+                type = "info";
+                color = "#9333ea"; // Purple
+                name = "Info Logs";
+                // Pretty print the JSON for the log description
+                detail = "Command Received: " + Object.keys(jsonObj).map(k => `${k}=${jsonObj[k]}`).join(', ');
+            }
+        } catch(e) {}
+
+        const lowerDetail = detail.toLowerCase();
+        
+        if (type !== "info") {
+            if (lowerDetail.includes("warning") || lowerDetail.includes("full batt") || lowerDetail.includes("low bat") || lowerDetail.includes("bad signal") || lowerDetail.includes("too hot")) {
+                type = "warning";
+                color = "#facc15"; // Yellow
+                name = "Warning Logs";
+            } else if (lowerDetail.includes("error") || lowerDetail.includes("failed") || lowerDetail.includes("not sending data") || lowerDetail.includes("sensor")) {
+                type = "error";
+                color = "#ef4444"; // Red
+                name = "Error Logs";
+            } else {
+                // Default fallback if it doesn't clearly match error/warning
+                type = "info";
+                color = "#9333ea"; // Purple
+                name = "Info Logs";
+            }
+        }
+        
+        const d = new Date(row.event_at);
+        const mm = String(d.getMonth() + 1).padStart(2, '0');
+        const dd = String(d.getDate()).padStart(2, '0');
+        const yyyy = d.getFullYear();
+        
+        const hh24 = d.getHours();
+        const min = String(d.getMinutes()).padStart(2, '0');
+        const ampm = hh24 >= 12 ? 'PM' : 'AM';
+        const hh12 = hh24 % 12 || 12;
+        const timeStr = `${String(hh12).padStart(2, '0')}:${min} ${ampm}`;
+
+        calendarEvents.push({
+            id: `s_${row.id}`,
+            name: name,
+            date: `${mm}/${dd}/${yyyy}`,
+            time: timeStr,
+            type: type,
+            description: detail,
+            color: color
+        });
+    });
+    
+    res.json(calendarEvents);
   } catch (e) {
     res.status(500).json({ error: e.message });
   }

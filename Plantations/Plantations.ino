@@ -20,6 +20,11 @@
 #include <ArduinoJson.h>
 #include <INA226.h>
 #include <RTClib.h>
+#include <Preferences.h>
+
+Preferences preferences;
+bool isAutoInterval = true;
+unsigned long targetCycleIntervalMs = 120000UL;
 
 // ───── Pin Definitions ───────────────────────────────────────────────────────
 // Soil Moisture (capacitive) – ADC1 channels (safe with WiFi)
@@ -80,10 +85,14 @@
 #define OFFSET_P 0.0f
 #define MULT_K 1.0f
 #define OFFSET_K 0.0f
-#define MULT_PH 1.0f
-#define OFFSET_PH 0.0f
 #define MULT_UV 1.0f
 #define OFFSET_UV 0.0f
+
+
+// Error Sensor Maybe
+#define MULT_PH 1.0f
+#define OFFSET_PH 0.0f
+
 
 // ───── Configuration ─────────────────────────────────────────────────────────
 // WiFi credentials (tries all and picks best signal)
@@ -262,30 +271,24 @@ float rawToUVIndex(int raw);
 extern "C" float temperatureRead();
 #endif
 
-// =============================================================================
-//  SETUP
-// =============================================================================
-void setup() {
-  Serial.begin(115200);
-  Serial.println(F("\n🌿 Garden Monitor Booting..."));
+void resetI2CBus() {
+  pinMode(21, OUTPUT);
+  pinMode(22, OUTPUT);
+  for (int i = 0; i < 9; i++) {
+    digitalWrite(22, HIGH);
+    delayMicroseconds(5);
+    digitalWrite(22, LOW);
+    delayMicroseconds(5);
+  }
+  pinMode(21, INPUT);
+  pinMode(22, INPUT);
+}
 
-  // Pin modes
-  pinMode(PIN_MOSFET_VALVE, OUTPUT);
-  digitalWrite(PIN_MOSFET_VALVE, LOW);
-  pinMode(PIN_MOSFET_3V3, OUTPUT);
-  digitalWrite(PIN_MOSFET_3V3, HIGH); // Turn ON initially for setup
-  pinMode(PIN_MOSFET_5V, OUTPUT);
-  digitalWrite(PIN_MOSFET_5V, HIGH); // Turn ON initially for setup
-  pinMode(PIN_RS485_DE_RE, OUTPUT);
-  digitalWrite(PIN_RS485_DE_RE, LOW);
-
-  // ADC attenuation for 0-3.3V range
-  analogSetAttenuation(ADC_11db);
-
-  // RS485 Serial
-  rs485Serial.begin(4800, SERIAL_8N1, PIN_RS485_RO, PIN_RS485_DI);
-
-  // I2C
+void initSensors() {
+  // Unstick the I2C bus in case sensors powered down while SDA/SCL were held low
+  resetI2CBus();
+  
+  // Re-initialize I2C bus (in case it was ended)
   Wire.begin();
 
   // AHT10
@@ -320,24 +323,43 @@ void setup() {
     if (ina226.configure(INA226_SHUNT_OHM, INA226_Current_LSB_mA, INA226_Current_Zero_Offset, INA226_Bus_V_scaling)) {
       Serial.println("\n***** Configuration Error! Chosen values outside range *****\n");
     } else {
-      Serial.println("\n***** INA 226 CONFIGURE *****");
-      Serial.print("Shunt:\t");
-      Serial.print(INA226_SHUNT_OHM, 4);
-      Serial.println(" Ohm");
-      Serial.print("current_LSB_mA:\t");
-      Serial.print(INA226_Current_LSB_mA * 1e+3, 1);
-      Serial.println(" uA / bit");
-      Serial.print("\nMax Measurable Current:\t");
-      Serial.print(ina226.getMaxCurrent(), 3);
-      Serial.println(" A");
-      Serial.println(" ");
-
       ina226.setAverage(2);  // 16-sample averaging for stable readings
       sensorData.stat_ina = 0;
     }
   }
+}
 
+// =============================================================================
+//  SETUP
+// =============================================================================
+void setup() {
+  Serial.begin(115200);
+  Serial.println(F("\n🌿 Garden Monitor Booting..."));
 
+  // Pin modes
+  pinMode(PIN_MOSFET_VALVE, OUTPUT);
+  digitalWrite(PIN_MOSFET_VALVE, LOW);
+  pinMode(PIN_MOSFET_3V3, OUTPUT);
+  digitalWrite(PIN_MOSFET_3V3, HIGH); // Turn ON initially for setup
+  pinMode(PIN_MOSFET_5V, OUTPUT);
+  digitalWrite(PIN_MOSFET_5V, HIGH); // Turn ON initially for setup
+  pinMode(PIN_RS485_DE_RE, OUTPUT);
+  digitalWrite(PIN_RS485_DE_RE, LOW);
+
+  // ADC attenuation for 0-3.3V range
+  analogSetAttenuation(ADC_11db);
+
+  // RS485 Serial
+  rs485Serial.begin(4800, SERIAL_8N1, PIN_RS485_RO, PIN_RS485_DI);
+
+  // Initialize Preferences (NVM)
+  preferences.begin("garden", false);
+  isAutoInterval = preferences.getBool("auto_interval", true);
+  targetCycleIntervalMs = preferences.getULong("interval_ms", 120000UL);
+  if (targetCycleIntervalMs < 120000UL) targetCycleIntervalMs = 120000UL; // Hard limit 2 mins
+
+  // Initialize sensors for the first time
+  initSensors();
 
   // RTC DS3231
   if (!rtc.begin()) {
@@ -380,9 +402,11 @@ void loop() {
   unsigned long now = millis();
 
   switch (cycleState) {
-    case STATE_SENSORS_OFF:
-      // Wait for 105 seconds with sensors off
-      if (now - stateTimer >= 105000UL) {
+    case STATE_SENSORS_OFF: {
+      // Calculate dynamic off time based on target cycle
+      unsigned long offDurationMs = targetCycleIntervalMs - 15000UL; // subtract 15s for warmup+sampling
+      
+      if (now - stateTimer >= offDurationMs) {
         digitalWrite(PIN_MOSFET_3V3, HIGH);
         digitalWrite(PIN_MOSFET_5V, HIGH);
         stateTimer = now;
@@ -390,6 +414,7 @@ void loop() {
         Serial.println(F("⚡ Sensors ON, warming up..."));
       }
       break;
+    }
 
     case STATE_SENSORS_WARMUP:
       // Wait 5 seconds for sensors to stabilize
@@ -398,7 +423,15 @@ void loop() {
         sampleCount = 0;
         acc.reset();
         cycleState = STATE_SAMPLING;
-        Serial.println(F("🔍 Warmup done, sampling..."));
+        Serial.println(F("🔍 Warmup done, initializing sensors..."));
+        
+        // Re-enable RS485 Serial port and DE/RE pin
+        pinMode(PIN_RS485_DE_RE, OUTPUT);
+        digitalWrite(PIN_RS485_DE_RE, LOW);
+        rs485Serial.begin(4800, SERIAL_8N1, PIN_RS485_RO, PIN_RS485_DI);
+
+        // RE-INITIALIZE I2C SENSORS after power was restored!
+        initSensors();
       }
       break;
 
@@ -416,6 +449,31 @@ void loop() {
 
           digitalWrite(PIN_MOSFET_3V3, LOW);
           digitalWrite(PIN_MOSFET_5V, LOW);
+          
+          // Disable I2C to prevent phantom power leakage through SDA/SCL pins
+          Wire.end();
+          pinMode(21, INPUT); // SDA
+          pinMode(22, INPUT); // SCL
+
+          // Disable RS485 Serial to prevent 5V rail leakage (1.9V)
+          rs485Serial.end();
+          pinMode(PIN_RS485_RO, INPUT);
+          pinMode(PIN_RS485_DI, INPUT);
+          pinMode(PIN_RS485_DE_RE, INPUT); // or OUTPUT LOW
+
+          // Disable 1-Wire pin (DS18B20) to prevent 3.3V leakage (0.35V)
+          pinMode(PIN_DS18B20, INPUT);
+          
+          // Calculate dynamic interval if AUTO
+          if (isAutoInterval) {
+              if (sensorData.busVoltageV > 1.0f && sensorData.busVoltageV < 3.7f) {
+                  targetCycleIntervalMs = 600000UL; // 10 mins on low battery
+                  Serial.println(F("🔋 Low battery detected, slowing poll to 10m"));
+              } else {
+                  targetCycleIntervalMs = 120000UL; // 2 mins normally
+              }
+          }
+
           stateTimer = now;
           cycleState = STATE_SENSORS_OFF;
           Serial.println(F("💤 Publish done, sensors OFF."));
@@ -496,6 +554,7 @@ void connectMQTT() {
       mqttClient.subscribe(MQTT_TOPIC_CMD);
     } else {
       Serial.printf(" failed (rc=%d), retry...\n", mqttClient.state());
+      yield(); // Keep WDT happy
       delay(3000);
     }
   }
@@ -518,7 +577,24 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
     controlValve(false);
   } else if (strcmp(cmd, "sync_rtc") == 0) {
     syncNTP();
-    // publishData();  // Removed as it expects fresh samples
+  } else if (strcmp(cmd, "set_interval") == 0) {
+    String val = doc["val"].as<String>();
+    if (val == "auto") {
+        isAutoInterval = true;
+        preferences.putBool("auto_interval", true);
+        Serial.println(F("⏱️  Interval set to AUTO"));
+    } else {
+        long ms = val.toInt();
+        if (ms >= 120000) {
+            isAutoInterval = false;
+            targetCycleIntervalMs = ms;
+            preferences.putBool("auto_interval", false);
+            preferences.putULong("interval_ms", ms);
+            Serial.printf("⏱️  Interval set to %ld ms\n", ms);
+        } else {
+            Serial.println(F("⚠️ Interval ignored (too fast)"));
+        }
+    }
   } else if (strcmp(cmd, "weather_prediction") == 0) {
     sensorData.remoteRainPredicted = doc["raining"] | false;
     sensorData.lastRemoteRainMs = millis();
@@ -760,6 +836,7 @@ void readNPKandPH() {
     int len = 0;
     unsigned long t = millis();
     while (millis() - t < 300) {
+      yield(); // Crucial to prevent ESP32 WDT reset!
       while (rs485Serial.available()) {
         if (len < 20) buf[len++] = rs485Serial.read();
         else rs485Serial.read();
@@ -906,9 +983,9 @@ void logSystemEvents() {
   
   JsonArray events = doc.createNestedArray("events");
   
-  if (sensorData.busVoltageV < 11.5f && sensorData.busVoltageV > 1.0f && sensorData.stat_ina != 2) {
+  if (sensorData.busVoltageV <= 2.85f && sensorData.busVoltageV > 1.0f && sensorData.stat_ina != 2) {
       events.add("Low Battery Warning: " + String(sensorData.busVoltageV, 1) + "V");
-  } else if (sensorData.busVoltageV > 13.8f && sensorData.stat_ina != 2) {
+  } else if (sensorData.busVoltageV >= 4.15f && sensorData.stat_ina != 2) {
       events.add("Battery Full: " + String(sensorData.busVoltageV, 1) + "V");
   }
   
