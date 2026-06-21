@@ -28,6 +28,8 @@ const DB_USER = process.env.DB_USER || 'garden_user';
 const DB_PASS = process.env.DB_PASS || 'garden_pass_2026!';
 const MQTT_HOST = process.env.MQTT_HOST || '192.168.88.88';
 const MQTT_PORT = parseInt(process.env.MQTT_PORT || '1883');
+const MQTT_USER = process.env.MQTT_USER || '';
+const MQTT_PASS = process.env.MQTT_PASS || '';
 const MQTT_TOPIC = process.env.MQTT_TOPIC_SUB || 'garden/sensors';
 const MQTT_CMD = process.env.MQTT_TOPIC_CMD || 'garden/commands';
 
@@ -123,6 +125,8 @@ function initMQTT() {
     clientId: `garden_web_${Math.random().toString(16).slice(2, 8)}`,
     clean: true,
     reconnectPeriod: 5000,
+    username: `${MQTT_USER}`, // Add your username here
+    password: `${MQTT_PASS}`, // Add your password here
   });
 
   mqttClient.on('connect', () => {

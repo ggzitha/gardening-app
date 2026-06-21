@@ -1,8 +1,19 @@
 // =============================================================================
-//  🌿 Garden Monitoring System - ESP32 Firmware
+//  🌿 Garden Monitoring System - ESP32 Firmware (Enhanced)
 //  Board  : ESP32 WROOM-32 (4MB)
 //  Author : Auto-generated
-//  Date   : 2026-05-06
+//  Date   : 2026-06-20
+// =============================================================================
+//
+//  ENHANCEMENTS:
+//  ✓ MQTT Optional (non-blocking, ping-check before connect)
+//  ✓ Local SQLite-style database using Preferences (FIFO)
+//  ✓ Embedded ESP32 Web Server (no external Docker needed)
+//  ✓ Cloud sync when MQTT server is available
+//  ✓ Reboot, OTA mode, Clear DB via Web UI
+//
+//  PARTITION SCHEME: "Huge App (3MB APP / 1MB SPIFFS)" - NO OTA
+//
 // =============================================================================
 
 // ───── Library Includes ──────────────────────────────────────────────────────
@@ -22,11 +33,30 @@
 #include <RTClib.h>
 #include <Preferences.h>
 
-Preferences preferences;
-bool isAutoInterval = true;
-unsigned long targetCycleIntervalMs = 120000UL;
+// ── Web Server & Async (ESP32Async - NOT me-no-dev) ─────────────────────────
+// Install from: https://github.com/ESP32Async/ESPAsyncWebServer (includes WebSocket)
+// Install from: https://github.com/ESP32Async/AsyncTCP
+#include <ESPAsyncWebServer.h>
+#include <AsyncTCP.h>
+#include <LittleFS.h>  // Use LittleFS for huge_app partition
 
-// ───── Pin Definitions ───────────────────────────────────────────────────────
+// ── OTA (Manual trigger only, not auto-OTA) ─────────────────────────────────
+#include <Update.h>
+
+// ───── Preferences (NVM) ────────────────────────────────────────────────────
+Preferences preferences;
+
+// ───── Configuration ────────────────────────────────────────────────────────
+struct Config {
+  bool isAutoInterval = true;
+  unsigned long targetCycleIntervalMs = 120000UL;
+  bool mqttEnabled = true;
+  bool otaEnabled = false;
+};
+
+Config config;
+
+// ───── Pin Definitions ──────────────────────────────────────────────────────
 // Soil Moisture (capacitive) – ADC1 channels (safe with WiFi)
 #define PIN_SOIL1 34  // ADC1_CH6
 #define PIN_SOIL2 35  // ADC1_CH7
@@ -36,8 +66,6 @@ unsigned long targetCycleIntervalMs = 120000UL;
 
 // UV Sensor (GUVA-S12SD)
 #define PIN_UV 33  // ADC1_CH5
-
-// PIN 39 was Raindrop Sensor (REMOVED)
 
 // DS18B20 Soil Temperature
 #define PIN_DS18B20 4  // 1-Wire data
@@ -53,28 +81,20 @@ unsigned long targetCycleIntervalMs = 120000UL;
 #define PIN_RS485_DE_RE 5  // Connect to both DE and RE pins (Drive Enable)
 
 // I2C (SDA=21, SCL=22 default) → AHT10 + INA226 + ADS1015
-// ADS1015 is used if extra ADC channels are needed (declared below)
 
 // ───── Calibration Configuration ─────────────────────────────────────────────
-// Formula: (reading * MULT_SENSOR_X) + OFFSET_SENSOR_X
-// DS18B20 Soil Temperature → calibrated to MH170 Temp
 #define MULT_SOIL_TEMP 1.3494f
 #define OFFSET_SOIL_TEMP -9.2477f
-// AHT10 → calibrated to MH170
 #define MULT_AHT_TEMP 1.1817f
 #define OFFSET_AHT_TEMP -5.9871f
 #define MULT_AHT_HUMIDITY 1.0562f
 #define OFFSET_AHT_HUMIDITY -14.9680f
-// HDC1080 → calibrated to MH170
 #define MULT_HDC_TEMP 1.0199f
 #define OFFSET_HDC_TEMP -1.1547f
 #define MULT_HDC_HUM 1.0190f
 #define OFFSET_HDC_HUM -5.1205f
-// BMP280 → calibrated to MH170
 #define MULT_BMP_TEMP 1.0239f
 #define OFFSET_BMP_TEMP -3.9511f
-
-// Not Calibrated
 #define MULT_BMP_PRES 1.0f
 #define OFFSET_BMP_PRES 0.0f
 #define MULT_SOC_TEMP 1.0f
@@ -87,15 +107,10 @@ unsigned long targetCycleIntervalMs = 120000UL;
 #define OFFSET_K 0.0f
 #define MULT_UV 1.0f
 #define OFFSET_UV 0.0f
-
-
-// Error Sensor Maybe
 #define MULT_PH 1.0f
 #define OFFSET_PH 0.0f
 
-
-// ───── Configuration ─────────────────────────────────────────────────────────
-// WiFi credentials (tries all and picks best signal)
+// ───── WiFi Credentials ────────────────────────────────────────────────────
 const char* WIFI_SSID1 = "DCLXVI";
 const char* WIFI_PASS1 = "1029384756";
 const char* WIFI_SSID2 = "BBWV_Oprasional";
@@ -103,40 +118,40 @@ const char* WIFI_PASS2 = "Balai5-OPRA123!";
 const char* WIFI_SSID3 = "BMKG-JAYAPURA";
 const char* WIFI_PASS3 = "bmkg@123";
 
-// NTP
-const char* NTP_SERVER = "pool.ntp.org";
-const long GMT_OFFSET_SEC = 9 * 3600;  // UTC+9 (adjust if needed)
+// ───── NTP ──────────────────────────────────────────────────────────────────
+const char* NTP1_SERVER = "pool.ntp.org";
+const char* NTP2_SERVER = "time.google.com";
+const char* NTP3_SERVER = "time.cloudflare.com";
+const long GMT_OFFSET_SEC = 9 * 3600;  // UTC+9
 const int DAYLIGHT_OFFSET_SEC = 0;
 
-// MQTT
-const char* MQTT_SERVER = "192.168.88.88";
+// ───── MQTT Configuration ────────────────────────────────────────────────────
+const char* MQTT_SERVER = "192.168.88.8";
 const int MQTT_PORT = 1883;
+const char* MQTT_USER   = "inskal";
+const char* MQTT_PASS   = "admin_inskal_mqtt";
 const char* MQTT_CLIENT_ID = "garden_esp32";
 const char* MQTT_TOPIC_PUB = "garden/sensors";
 const char* MQTT_TOPIC_CMD = "garden/commands";
 
-// Timing
-const unsigned long CYCLE_INTERVAL_MS = 120000UL;  // 2 minutes total cycle
+// ───── Timing ───────────────────────────────────────────────────────────────
+const unsigned long CYCLE_INTERVAL_MS = 120000UL;  // 2 minutes
 
-// Thresholds
-const int SOIL_DRY_THRESHOLD = 2800;  // ADC raw (0-4095, dry = high value for cap. sensor)
+// ───── Thresholds ───────────────────────────────────────────────────────────
+const int SOIL_DRY_THRESHOLD = 2800;
 const int SOIL_WET_THRESHOLD = 1800;
-// Raindrop sensor threshold removed (using pressure trend)
-const float TEMP_HOT_THRESHOLD = 35.0f;  // °C
-
-// Watering
+const float TEMP_HOT_THRESHOLD = 35.0f;
 const unsigned long WATER_MAX_MS = 180000UL;  // 3 minutes max
 
-
-#define INA226_SHUNT_OHM 0.0115f         // Soldered R010 = 0.010 Ohm, but add fine tunning
-#define INA226_Current_LSB_mA 0.20f      // Max measurable current = 32768 x current_LSB.
-#define INA226_Current_Zero_Offset 0.0f  // current_zero_offset_mA (Current Zero Offset in milli Amperes, default = 0)
-#define INA226_Bus_V_scaling 10000       /* bus_V_scaling_e4 (Bus Voltage Scaling Factor, default = 10000) */
-
+// ───── INA226 Calibration ───────────────────────────────────────────────────
+#define INA226_SHUNT_OHM 0.0115f
+#define INA226_Current_LSB_mA 0.20f
+#define INA226_Current_Zero_Offset 0.0f
+#define INA226_Bus_V_scaling 10000
 #define INA226_I_OFFSET_mA -198.593f
 #define INA226_V_OFFSET_v -0.155f
 
-// ───── Global Objects ────────────────────────────────────────────────────────
+// ───── Global Objects ───────────────────────────────────────────────────────
 WiFiMulti wifiMulti;
 WiFiClient wifiClient;
 PubSubClient mqttClient(wifiClient);
@@ -150,16 +165,20 @@ ClosedCube_HDC1080 hdc1080;
 INA226 ina226(0x45);
 RTC_DS3231 rtc;
 
-// RS485 Serial
 HardwareSerial rs485Serial(2);  // UART2
 
-// ───── State Variables ───────────────────────────────────────────────────────
+// ───── Web Server ──────────────────────────────────────────────────────────
+AsyncWebServer server(80);
+AsyncWebSocket wsServer("/ws");
+bool wsClientConnected = false;
+
+// ───── State Variables ─────────────────────────────────────────────────────
 enum CycleState {
   STATE_SENSORS_OFF,
   STATE_SENSORS_WARMUP,
-  STATE_SAMPLING
+  STATE_SENSORS_SAMPLING
 };
-CycleState cycleState = STATE_SENSORS_WARMUP; // Start with warmup to get initial readings
+CycleState cycleState = STATE_SENSORS_WARMUP;
 unsigned long stateTimer = 0;
 int sampleCount = 0;
 
@@ -168,41 +187,32 @@ bool isWatering = false;
 float wateringStartMoisture = 0.0f;
 bool manualWateringActive = false;
 
+// ───── Sensor Data Structure ───────────────────────────────────────────────
 struct SensorData {
-  // Soil moisture (raw ADC, average of 3 sensors)
   int soil1Raw, soil2Raw, soil3Raw;
-  float soilMoistureAvgPct;  // 0–100 %
-  float soilTempC;           // DS18B20
-  // Ambient
+  float soilMoistureAvgPct;
+  float soilTempC;
   float ambientTempC;
   float humidityPct;
-  // UV
   float uvIndex;
-  // Rain
-  int rainRaw;     // Now unused or for compatibility
-  bool isRaining;  // Based on sensors or remote prediction
-  // NPK + PH (read continuously)
+  int rainRaw;
+  bool isRaining;
   float nitrogenPpm;
   float phosphorusPpm;
   float potassiumPpm;
   float phValue;
   bool npkValid;
-  // Power
   float busVoltageV;
   float currentMA;
   float powerMW;
   bool isCharging;
-  // New Sensors
   float envTempC;
   float envHumPct;
   float intTempC;
   float intPresHPa;
   float socTempC;
-  // Timestamp
   time_t timestamp;
-  // Status Flags (0=OK, 1=WARN, 2=ERR)
   uint8_t stat_rtc, stat_npk, stat_aht, stat_ds18, stat_ina, stat_bmp, stat_hdc;
-  // Pressure history for offline rain detection (last 3 hours, every 15 mins)
   float presHistory[12];
   int presIdx = 0;
   bool presHistReady = false;
@@ -211,52 +221,103 @@ struct SensorData {
   unsigned long lastRemoteRainMs = 0;
 } sensorData;
 
-// ───── Accumulator for 1-minute averaging ────────────────────────────────────
+// ───── Accumulator ─────────────────────────────────────────────────────────
 struct SensorAccumulator {
-  float soilMoistureAvgPct;
-  int c_soilMoisture;
-  float soilTempC;
-  int c_soilTemp;
-  float ambientTempC;
-  int c_ambientTemp;
-  float humidityPct;
-  int c_humidity;
-  float uvIndex;
-  int c_uv;
-  float nitrogenPpm;
-  int c_nitrogen;
-  float phosphorusPpm;
-  int c_phosphorus;
-  float potassiumPpm;
-  int c_potassium;
-  float phValue;
-  int c_ph;
-  float busVoltageV;
-  int c_busVoltage;
-  float currentMA;
-  int c_current;
-  float powerMW;
-  int c_power;
-  float envTempC;
-  int c_envTemp;
-  float envHumPct;
-  int c_envHum;
-  float intTempC;
-  int c_intTemp;
-  float intPresHPa;
-  int c_intPres;
-  float socTempC;
-  int c_socTemp;
-  void reset() {
-    memset(this, 0, sizeof(SensorAccumulator));
-  }
+  float soilMoistureAvgPct; int c_soilMoisture = 0;
+  float soilTempC; int c_soilTemp = 0;
+  float ambientTempC; int c_ambientTemp = 0;
+  float humidityPct; int c_humidity = 0;
+  float uvIndex; int c_uv = 0;
+  float nitrogenPpm; int c_nitrogen = 0;
+  float phosphorusPpm; int c_phosphorus = 0;
+  float potassiumPpm; int c_potassium = 0;
+  float phValue; int c_ph = 0;
+  float busVoltageV; int c_busVoltage = 0;
+  float currentMA; int c_current = 0;
+  float powerMW; int c_power = 0;
+  float envTempC; int c_envTemp = 0;
+  float envHumPct; int c_envHum = 0;
+  float intTempC; int c_intTemp = 0;
+  float intPresHPa; int c_intPres = 0;
+  float socTempC; int c_socTemp = 0;
+  void reset() { memset(this, 0, sizeof(SensorAccumulator)); }
 } acc;
 
-// ───── Forward Declarations ──────────────────────────────────────────────────
+// ───── LittleFS Debug Function ─────────────────────────────────────────────
+void listSPIFFSFiles() {
+  Serial.println(F("\n📁 LittleFS Files Listing:"));
+  File root = LittleFS.open("/");
+  if (!root) {
+    Serial.println(F("❌ Failed to open root directory"));
+    return;
+  }
+  
+  if (!root.isDirectory()) {
+    Serial.println(F("❌ Root is not a directory"));
+    root.close();
+    return;
+  }
+  
+  File file = root.openNextFile();
+  int fileCount = 0;
+  while (file) {
+    if (file.isDirectory()) {
+      Serial.printf("  📂 %s/\n", file.name());
+    } else {
+      Serial.printf("  📄 %s (%d bytes)\n", file.name(), file.size());
+      fileCount++;
+    }
+    file = root.openNextFile();
+  }
+  
+  if (fileCount == 0) {
+    Serial.println(F("  ⚠️  No files found in LittleFS!"));
+    Serial.println(F("  💡 Make sure to upload data folder using LittleFS Upload"));
+  } else {
+    Serial.printf("  ✅ Total: %d files\n", fileCount);
+  }
+  
+  root.close();
+  Serial.printf("  💾 LittleFS Stats: Total=%d, Used=%d, Free=%d bytes\n", 
+                LittleFS.totalBytes(), LittleFS.usedBytes(), LittleFS.totalBytes() - LittleFS.usedBytes());
+  Serial.println();
+}
+
+// ───── Local Database (LittleFS-based) ─────────────────────────────────────
+#define DB_MAGIC "GDBS"
+#define DB_VERSION 1
+#define DB_MAX_RECORDS 10000  // FIFO limit
+
+struct __attribute__((packed)) SensorRecord {
+  uint32_t magic;
+  uint32_t timestamp;
+  int16_t soil1Raw, soil2Raw, soil3Raw;
+  float soilMoisture, soilTemp, ambientTemp, humidity;
+  float uvIndex, batteryV, currentMA, powerMW;
+  float nitrogen, phosphorus, potassium, ph;
+  float envTemp, envHum, intTemp, intPres;
+  uint8_t isRaining, valveOpen;
+  uint8_t statusFlags;
+};
+
+bool initDatabase();
+bool dbAddRecord();
+void dbSyncToCloud();
+void dbClear();
+void dbGetStats(JsonObject &doc);
+uint32_t dbGetRecordCount();
+void dbPruneOldest(uint32_t keepCount);
+bool dbInitialized = false;  // Track if database is ready
+
+// ───── Database Filename (declared early for use by serveHistory) ─────────────
+const char* DB_FILENAME = "/garden.db";
+
+// ───── Forward Declarations ─────────────────────────────────────────────────
 void connectWiFi();
 void syncNTP();
-void connectMQTT();
+void initMQTT();
 void mqttCallback(char* topic, byte* payload, unsigned int length);
+bool pingMQTTHost();
 void readSensors();
 void readNPKandPH();
 void processAndPublishData();
@@ -266,104 +327,61 @@ void controlValve(bool open, bool isManual = false);
 String buildJsonPayload();
 float rawToMoisturePct(int raw);
 float rawToUVIndex(int raw);
+void setupWebServer();
+void sendWebSocketData();
+void initSensors();
+void resetI2CBus();
+void serveHistory(AsyncWebServerRequest* request, const String& sensor);
 
-#ifdef __cplusplus
-extern "C" float temperatureRead();
-#endif
-
-void resetI2CBus() {
-  pinMode(21, OUTPUT);
-  pinMode(22, OUTPUT);
-  for (int i = 0; i < 9; i++) {
-    digitalWrite(22, HIGH);
-    delayMicroseconds(5);
-    digitalWrite(22, LOW);
-    delayMicroseconds(5);
-  }
-  pinMode(21, INPUT);
-  pinMode(22, INPUT);
-}
-
-void initSensors() {
-  // Unstick the I2C bus in case sensors powered down while SDA/SCL were held low
-  resetI2CBus();
-  
-  // Re-initialize I2C bus (in case it was ended)
-  Wire.begin();
-
-  // AHT10
-  if (!aht10.begin()) {
-    Serial.println(F("⚠️  AHT10 not found – check wiring!"));
-    sensorData.stat_aht = 2;
-  } else sensorData.stat_aht = 0;
-
-  // BMP280
-  if (!bmp280.begin(0x76) && !bmp280.begin(0x77)) {
-    Serial.println(F("⚠️  BMP280 not found!"));
-    sensorData.stat_bmp = 2;
-  } else {
-    sensorData.stat_bmp = 0;
-    bmp280.setSampling(Adafruit_BMP280::MODE_NORMAL, Adafruit_BMP280::SAMPLING_X2, Adafruit_BMP280::SAMPLING_X16, Adafruit_BMP280::FILTER_X16, Adafruit_BMP280::STANDBY_MS_500);
-  }
-
-  // HDC1080
-  hdc1080.begin(0x40);
-  sensorData.stat_hdc = 0;
-
-  // DS18B20
-  ds18b20.begin();
-  if (ds18b20.getDeviceCount() > 0) sensorData.stat_ds18 = 0;
-  else sensorData.stat_ds18 = 2;
-
-  // INA226
-  if (!ina226.begin()) {
-    Serial.println(F("⚠️  INA226 not found!"));
-    sensorData.stat_ina = 2;
-  } else {
-    if (ina226.configure(INA226_SHUNT_OHM, INA226_Current_LSB_mA, INA226_Current_Zero_Offset, INA226_Bus_V_scaling)) {
-      Serial.println("\n***** Configuration Error! Chosen values outside range *****\n");
-    } else {
-      ina226.setAverage(2);  // 16-sample averaging for stable readings
-      sensorData.stat_ina = 0;
-    }
-  }
-}
-
-// =============================================================================
+// ═════════════════════════════════════════════════════════════════════════════
 //  SETUP
-// =============================================================================
+// ═════════════════════════════════════════════════════════════════════════════
 void setup() {
   Serial.begin(115200);
-  Serial.println(F("\n🌿 Garden Monitor Booting..."));
+  Serial.println(F("\n🌿 Garden Monitor Booting (Enhanced v2.0)..."));
+  Serial.printf("   Partition: Huge APP (3MB) / SPIFFS (1MB)\n");
+  Serial.printf("   MQTT: Optional (syncs when available)\n");
+  Serial.printf("   Local DB: LittleFS with FIFO\n");
 
   // Pin modes
   pinMode(PIN_MOSFET_VALVE, OUTPUT);
   digitalWrite(PIN_MOSFET_VALVE, LOW);
   pinMode(PIN_MOSFET_3V3, OUTPUT);
-  digitalWrite(PIN_MOSFET_3V3, HIGH); // Turn ON initially for setup
+  digitalWrite(PIN_MOSFET_3V3, HIGH);
   pinMode(PIN_MOSFET_5V, OUTPUT);
-  digitalWrite(PIN_MOSFET_5V, HIGH); // Turn ON initially for setup
+  digitalWrite(PIN_MOSFET_5V, HIGH);
   pinMode(PIN_RS485_DE_RE, OUTPUT);
   digitalWrite(PIN_RS485_DE_RE, LOW);
 
-  // ADC attenuation for 0-3.3V range
+  // ADC attenuation
   analogSetAttenuation(ADC_11db);
 
   // RS485 Serial
   rs485Serial.begin(4800, SERIAL_8N1, PIN_RS485_RO, PIN_RS485_DI);
 
-  // Initialize Preferences (NVM)
+  // Initialize Preferences
   preferences.begin("garden", false);
-  isAutoInterval = preferences.getBool("auto_interval", true);
-  targetCycleIntervalMs = preferences.getULong("interval_ms", 120000UL);
-  if (targetCycleIntervalMs < 120000UL) targetCycleIntervalMs = 120000UL; // Hard limit 2 mins
+  config.isAutoInterval = preferences.getBool("auto_interval", true);
+  config.targetCycleIntervalMs = preferences.getULong("interval_ms", 120000UL);
+  config.mqttEnabled = preferences.getBool("mqtt_enabled", true);
+  if (config.targetCycleIntervalMs < 120000UL) config.targetCycleIntervalMs = 120000UL;
 
-  // Initialize sensors for the first time
+  // Initialize LittleFS for web files
+  if (!LittleFS.begin(true)) {
+    Serial.println(F("⚠️  LittleFS mount failed"));
+  } else {
+    Serial.println(F("✅ LittleFS initialized"));
+  }
+  
+  // Debug: List all files in SPIFFS
+  listSPIFFSFiles();
+
+  // Initialize sensors
   initSensors();
 
   // RTC DS3231
   if (!rtc.begin()) {
-    Serial.println(F("⚠️  Couldn't find RTC"));
+    Serial.println(F("⚠️  RTC not found"));
     sensorData.stat_rtc = 2;
   } else {
     sensorData.stat_rtc = rtc.lostPower() ? 1 : 0;
@@ -375,37 +393,55 @@ void setup() {
   // NTP
   syncNTP();
 
-  // MQTT
+  // Initialize local database
+  initDatabase();
+
+  // MQTT (optional)
   mqttClient.setServer(MQTT_SERVER, MQTT_PORT);
   mqttClient.setCallback(mqttCallback);
   mqttClient.setBufferSize(1024);
-  connectMQTT();
+  if (config.mqttEnabled) initMQTT();
 
-  // Enable Auto Modem Sleep for WiFi
+  // Web Server
+  setupWebServer();
+
+  // Enable WiFi power saving
   esp_wifi_set_ps(WIFI_PS_MAX_MODEM);
   Serial.println(F("✅ WiFi Auto Modem Sleep enabled"));
 
   Serial.println(F("✅ Setup complete!"));
   acc.reset();
-  
-  stateTimer = millis(); // Start the state machine
+  stateTimer = millis();
 }
 
-// =============================================================================
+// ═════════════════════════════════════════════════════════════════════════════
 //  LOOP
-// =============================================================================
+// ═════════════════════════════════════════════════════════════════════════════
 void loop() {
-  // Keep MQTT alive
-  if (!mqttClient.connected()) connectMQTT();
-  mqttClient.loop();
-
   unsigned long now = millis();
 
+  // AsyncWebSocket is event-driven - no loop() needed
+
+  // Keep MQTT alive (optional)
+  if (config.mqttEnabled && mqttClient.connected()) {
+    mqttClient.loop();
+  } else if (config.mqttEnabled && WiFi.status() == WL_CONNECTED) {
+    // Try reconnecting MQTT periodically
+    static unsigned long lastMqttRetry = 0;
+    if (now - lastMqttRetry > 60000) {  // Every 60 seconds
+      lastMqttRetry = now;
+      initMQTT();
+      // If connected, sync local DB to cloud
+      if (mqttClient.connected()) {
+        dbSyncToCloud();
+      }
+    }
+  }
+
+  // State machine
   switch (cycleState) {
     case STATE_SENSORS_OFF: {
-      // Calculate dynamic off time based on target cycle
-      unsigned long offDurationMs = targetCycleIntervalMs - 15000UL; // subtract 15s for warmup+sampling
-      
+      unsigned long offDurationMs = config.targetCycleIntervalMs - 15000UL;
       if (now - stateTimer >= offDurationMs) {
         digitalWrite(PIN_MOSFET_3V3, HIGH);
         digitalWrite(PIN_MOSFET_5V, HIGH);
@@ -417,61 +453,53 @@ void loop() {
     }
 
     case STATE_SENSORS_WARMUP:
-      // Wait 5 seconds for sensors to stabilize
       if (now - stateTimer >= 5000UL) {
         stateTimer = now;
         sampleCount = 0;
         acc.reset();
-        cycleState = STATE_SAMPLING;
+        cycleState = STATE_SENSORS_SAMPLING;
         Serial.println(F("🔍 Warmup done, initializing sensors..."));
         
-        // Re-enable RS485 Serial port and DE/RE pin
         pinMode(PIN_RS485_DE_RE, OUTPUT);
         digitalWrite(PIN_RS485_DE_RE, LOW);
         rs485Serial.begin(4800, SERIAL_8N1, PIN_RS485_RO, PIN_RS485_DI);
-
-        // RE-INITIALIZE I2C SENSORS after power was restored!
         initSensors();
       }
       break;
 
-    case STATE_SAMPLING:
-      // Sample 5 times over 10 seconds (every 2 seconds)
+    case STATE_SENSORS_SAMPLING:
       if (now - stateTimer >= 2000UL) {
         stateTimer = now;
         readSensors();
         sampleCount++;
         if (sampleCount >= 5) {
-          // Done sampling
           processAndPublishData();
           checkAutoWatering();
           logSystemEvents();
 
+          // Store to local DB
+          dbAddRecord();
+
+          // Disable sensors to save power
           digitalWrite(PIN_MOSFET_3V3, LOW);
           digitalWrite(PIN_MOSFET_5V, LOW);
-          
-          // Disable I2C to prevent phantom power leakage through SDA/SCL pins
           Wire.end();
-          pinMode(21, INPUT); // SDA
-          pinMode(22, INPUT); // SCL
-
-          // Disable RS485 Serial to prevent 5V rail leakage (1.9V)
+          pinMode(21, INPUT);
+          pinMode(22, INPUT);
           rs485Serial.end();
           pinMode(PIN_RS485_RO, INPUT);
           pinMode(PIN_RS485_DI, INPUT);
-          pinMode(PIN_RS485_DE_RE, INPUT); // or OUTPUT LOW
-
-          // Disable 1-Wire pin (DS18B20) to prevent 3.3V leakage (0.35V)
+          pinMode(PIN_RS485_DE_RE, INPUT);
           pinMode(PIN_DS18B20, INPUT);
           
-          // Calculate dynamic interval if AUTO
-          if (isAutoInterval) {
-              if (sensorData.busVoltageV > 1.0f && sensorData.busVoltageV < 3.7f) {
-                  targetCycleIntervalMs = 600000UL; // 10 mins on low battery
-                  Serial.println(F("🔋 Low battery detected, slowing poll to 10m"));
-              } else {
-                  targetCycleIntervalMs = 120000UL; // 2 mins normally
-              }
+          // Dynamic interval if AUTO
+          if (config.isAutoInterval) {
+            if (sensorData.busVoltageV > 1.0f && sensorData.busVoltageV < 3.7f) {
+              config.targetCycleIntervalMs = 600000UL;
+              Serial.println(F("🔋 Low battery - slowing to 10m interval"));
+            } else {
+              config.targetCycleIntervalMs = 120000UL;
+            }
           }
 
           stateTimer = now;
@@ -482,18 +510,18 @@ void loop() {
       break;
   }
 
-  // Watering watchdog – cut off after max time
+  // Watering watchdog
   if (isWatering && (now - wateringStartMs >= WATER_MAX_MS)) {
     Serial.println(F("⏱️  Watering timeout – closing valve"));
     controlValve(false);
   }
 
-  delay(100); // Allow Auto Modem Sleep to kick in
+  delay(100);
 }
 
-// =============================================================================
+// ═════════════════════════════════════════════════════════════════════════════
 //  WiFi
-// =============================================================================
+// ═════════════════════════════════════════════════════════════════════════════
 void connectWiFi() {
   Serial.println(F("📶 Connecting to WiFi..."));
   wifiMulti.addAP(WIFI_SSID1, WIFI_PASS1);
@@ -513,13 +541,12 @@ void connectWiFi() {
                 WiFi.SSID().c_str(), WiFi.localIP().toString().c_str());
 }
 
-// =============================================================================
+// ═════════════════════════════════════════════════════════════════════════════
 //  NTP Sync
-// =============================================================================
+// ═════════════════════════════════════════════════════════════════════════════
 void syncNTP() {
   Serial.println(F("🕐 Syncing NTP..."));
-  configTime(GMT_OFFSET_SEC, DAYLIGHT_OFFSET_SEC, NTP_SERVER,
-             "time.google.com", "time.cloudflare.com");
+  configTime(GMT_OFFSET_SEC, DAYLIGHT_OFFSET_SEC, NTP1_SERVER, NTP2_SERVER, NTP3_SERVER);
   struct tm timeinfo;
   int retry = 0;
   while (!getLocalTime(&timeinfo) && retry++ < 10) {
@@ -529,9 +556,8 @@ void syncNTP() {
   if (retry < 10) {
     char buf[32];
     strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", &timeinfo);
-    Serial.printf("\n✅ Time synced via NTP: %s\n", buf);
+    Serial.printf("\n✅ Time synced: %s\n", buf);
 
-    // Sync RTC if it's connected
     if (sensorData.stat_rtc != 2) {
       rtc.adjust(DateTime(timeinfo.tm_year + 1900, timeinfo.tm_mon + 1, timeinfo.tm_mday, timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec));
       Serial.println(F("✅ DS3231 RTC Updated"));
@@ -541,21 +567,45 @@ void syncNTP() {
   }
 }
 
-// =============================================================================
-//  MQTT
-// =============================================================================
-void connectMQTT() {
+// ═════════════════════════════════════════════════════════════════════════════
+//  MQTT (Optional - Non-blocking)
+// ═════════════════════════════════════════════════════════════════════════════
+bool pingMQTTHost() {
+  if (WiFi.status() != WL_CONNECTED) return false;
+  
+  WiFiClient pingClient;
+  pingClient.setTimeout(2000);
+  
+  if (pingClient.connect(MQTT_SERVER, MQTT_PORT)) {
+    pingClient.stop();
+    return true;
+  }
+  return false;
+}
+
+void initMQTT() {
   if (WiFi.status() != WL_CONNECTED) return;
-  Serial.printf("🔌 Connecting MQTT to %s:%d...", MQTT_SERVER, MQTT_PORT);
+  
+  Serial.printf("🔌 Checking MQTT at %s:%d...", MQTT_SERVER, MQTT_PORT);
+  
+  // Non-blocking: skip if server unreachable
+  if (!pingMQTTHost()) {
+    Serial.println(F(" unreachable – MQTT disabled for now"));
+    return;
+  }
+  
+  Serial.println(F(" reachable, connecting..."));
   int attempts = 0;
-  while (!mqttClient.connected() && attempts++ < 5) {
-    if (mqttClient.connect(MQTT_CLIENT_ID)) {
-      Serial.println(F(" OK"));
+  while (!mqttClient.connected() && attempts++ < 3) {  // Only 3 attempts, not 5
+    if (mqttClient.connect(MQTT_CLIENT_ID, MQTT_USER, MQTT_PASS)) {
+      Serial.println(F("✅ MQTT connected"));
       mqttClient.subscribe(MQTT_TOPIC_CMD);
+      
+      // Sync local DB to cloud on successful reconnect
+      dbSyncToCloud();
     } else {
       Serial.printf(" failed (rc=%d), retry...\n", mqttClient.state());
-      yield(); // Keep WDT happy
-      delay(3000);
+      delay(2000);
     }
   }
 }
@@ -580,46 +630,740 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
   } else if (strcmp(cmd, "set_interval") == 0) {
     String val = doc["val"].as<String>();
     if (val == "auto") {
-        isAutoInterval = true;
-        preferences.putBool("auto_interval", true);
-        Serial.println(F("⏱️  Interval set to AUTO"));
+      config.isAutoInterval = true;
+      preferences.putBool("auto_interval", true);
+      Serial.println(F("⏱️  Interval set to AUTO"));
     } else {
-        long ms = val.toInt();
-        if (ms >= 120000) {
-            isAutoInterval = false;
-            targetCycleIntervalMs = ms;
-            preferences.putBool("auto_interval", false);
-            preferences.putULong("interval_ms", ms);
-            Serial.printf("⏱️  Interval set to %ld ms\n", ms);
-        } else {
-            Serial.println(F("⚠️ Interval ignored (too fast)"));
-        }
+      long ms = val.toInt();
+      if (ms >= 120000) {
+        config.isAutoInterval = false;
+        config.targetCycleIntervalMs = ms;
+        preferences.putBool("auto_interval", false);
+        preferences.putULong("interval_ms", ms);
+        Serial.printf("⏱️  Interval set to %ld ms\n", ms);
+      }
     }
   } else if (strcmp(cmd, "weather_prediction") == 0) {
     sensorData.remoteRainPredicted = doc["raining"] | false;
     sensorData.lastRemoteRainMs = millis();
-    Serial.printf("🌧️  Remote Prediction: %s\n", sensorData.remoteRainPredicted ? "RAIN" : "CLEAR");
+  } else if (strcmp(cmd, "db_stats") == 0) {
+    // Return DB stats via MQTT
+    StaticJsonDocument<512> resp;
+    JsonObject obj = resp.as<JsonObject>();
+    dbGetStats(obj);
+    char buf[512];
+    serializeJson(resp, buf);
+    mqttClient.publish(MQTT_TOPIC_PUB, buf);
   }
 }
 
-// =============================================================================
-//  Sensor Reading
-// =============================================================================
+// ═════════════════════════════════════════════════════════════════════════════
+//  Web Server
+// ═════════════════════════════════════════════════════════════════════════════
+void setupWebServer() {
+  // CORS headers - must be added BEFORE other handlers
+  DefaultHeaders::Instance().addHeader("Access-Control-Allow-Origin", "*");
+  DefaultHeaders::Instance().addHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+  DefaultHeaders::Instance().addHeader("Access-Control-Allow-Headers", "Content-Type");
+  
+  // LittleFS file server - serve static files from /data folder
+  server.serveStatic("/", LittleFS, "/").setDefaultFile("index.html");
+
+  // API: Latest reading
+  server.on("/api/latest", HTTP_GET, [](AsyncWebServerRequest *request) {
+    String json = buildJsonPayload();
+    request->send(200, "application/json", json);
+  });
+
+  // API: Database stats (expanded for comprehensive storage info)
+  server.on("/api/db/stats", HTTP_GET, [](AsyncWebServerRequest *request) {
+    StaticJsonDocument<2048> doc;
+    JsonObject obj = doc.as<JsonObject>();
+    dbGetStats(obj);
+    doc["ip"] = WiFi.localIP().toString();
+    doc["wifi_rssi"] = WiFi.RSSI();
+    doc["free_heap"] = ESP.getFreeHeap();
+    doc["sketch_size"] = ESP.getSketchSize();
+    doc["free_flash"] = ESP.getFreeSketchSpace();
+    String json;
+    serializeJson(doc, json);
+    request->send(200, "application/json", json);
+  });
+
+  // API: Clear database
+  server.on("/api/db/clear", HTTP_POST, [](AsyncWebServerRequest *request) {
+    dbClear();
+    request->send(200, "application/json", "{\"ok\":true,\"message\":\"Database cleared\"}");
+  });
+
+  // API: Command — reads JSON body from POST request
+  // Uses onRequestBody callback to accumulate raw body
+  server.on("/api/command", HTTP_POST, [](AsyncWebServerRequest *request) {
+    // Body was accumulated by onRequestBody callback below
+    if (request->_tempObject == nullptr) {
+      request->send(400, "application/json", "{\"error\":\"No body received\"}");
+      return;
+    }
+    
+    String body = *(String*)request->_tempObject;
+    delete (String*)request->_tempObject;
+    request->_tempObject = nullptr;
+
+    Serial.printf("📥 Command body: %s\n", body.c_str());
+
+    StaticJsonDocument<256> doc;
+    DeserializationError error = deserializeJson(doc, body);
+    if (error) {
+      request->send(400, "application/json", "{\"error\":\"Invalid JSON\"}");
+      return;
+    }
+
+    const char* cmd = doc["cmd"] | "";
+    String response = "{\"ok\":true,\"cmd\":\"" + String(cmd) + "\"}";
+
+    if (strcmp(cmd, "water_start") == 0) {
+      controlValve(true, true);
+    } else if (strcmp(cmd, "water_stop") == 0) {
+      controlValve(false);
+    } else if (strcmp(cmd, "sync_rtc") == 0) {
+      syncNTP();
+    } else if (strcmp(cmd, "reboot") == 0) {
+      request->send(200, "application/json", "{\"ok\":true,\"message\":\"Rebooting...\"}");
+      delay(500);
+      ESP.restart();
+    } else if (strcmp(cmd, "ota_enable") == 0) {
+      config.otaEnabled = true;
+      preferences.putBool("ota_enabled", true);
+      response = "{\"ok\":true,\"message\":\"OTA enabled on port 3232\"}";
+    } else if (strcmp(cmd, "ota_disable") == 0) {
+      config.otaEnabled = false;
+      preferences.putBool("ota_enabled", false);
+      response = "{\"ok\":true,\"message\":\"OTA disabled\"}";
+    } else if (strcmp(cmd, "set_interval") == 0) {
+      String val = doc["val"] | "";
+      if (val == "auto") {
+        config.isAutoInterval = true;
+        preferences.putBool("auto_interval", true);
+      } else {
+        long ms = val.toInt();
+        if (ms >= 120000) {
+          config.isAutoInterval = false;
+          config.targetCycleIntervalMs = ms;
+          preferences.putBool("auto_interval", false);
+          preferences.putULong("interval_ms", ms);
+        }
+      }
+    } else if (strcmp(cmd, "mqtt_enable") == 0) {
+      config.mqttEnabled = true;
+      preferences.putBool("mqtt_enabled", true);
+      initMQTT();
+    } else if (strcmp(cmd, "mqtt_disable") == 0) {
+      config.mqttEnabled = false;
+      preferences.putBool("mqtt_enabled", false);
+      mqttClient.disconnect();
+    } else if (strcmp(cmd, "purge_db") == 0) {
+      dbClear();
+      response = "{\"ok\":true,\"message\":\"Database purged\"}";
+    }
+
+    request->send(200, "application/json", response);
+  });
+
+  // onRequestBody callback - runs BEFORE the handler
+  // Must be registered BEFORE server.begin()
+  server.onRequestBody([](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total) {
+    // Only accumulate for /api/command POST
+    if (request->url() != "/api/command" || request->method() != HTTP_POST) return;
+    
+    // Allocate String on first chunk
+    if (index == 0) {
+      if (request->_tempObject != nullptr) {
+        delete (String*)request->_tempObject;
+      }
+      request->_tempObject = new String();
+    }
+    
+    // Append data to String
+    if (request->_tempObject) {
+      ((String*)request->_tempObject)->concat((char*)data, len);
+    }
+  });
+
+  // API: History (reads from local DB)
+  // Supports: /api/history?sensor=soil_moisture OR /api/history/soil_moisture
+  server.on("/api/history", HTTP_GET, [](AsyncWebServerRequest *request) {
+    String sensor = "soil_moisture";
+    if (request->hasParam("sensor")) {
+      sensor = request->getParam("sensor")->value();
+    }
+    serveHistory(request, sensor);
+  });
+
+  // Additional route: /api/history/<sensor>
+  server.on("/api/history/*", HTTP_GET, [](AsyncWebServerRequest *request) {
+    String url = request->url();
+    int slashIdx = url.lastIndexOf('/');
+    String sensor = (slashIdx > 0) ? url.substring(slashIdx + 1) : "soil_moisture";
+    int qIdx = sensor.indexOf('?');
+    if (qIdx > 0) sensor = sensor.substring(0, qIdx);
+    serveHistory(request, sensor);
+  });
+
+  // Fallback to index.html for SPA
+  server.onNotFound([](AsyncWebServerRequest *request) {
+    request->send(LittleFS, "/index.html", "text/html");
+  });
+
+  // Start server
+  server.begin();
+  Serial.println(F("✅ Web server started on port 80"));
+
+// WebSocket - AsyncWebSocket is built into ESPAsyncWebServer
+  wsServer.onEvent([](AsyncWebSocket *server, AsyncWebSocketClient *client, AwsEventType type, void *arg, uint8_t *data, size_t len) {
+    switch (type) {
+      case 0: // WS_CONNECTED
+        wsClientConnected = true;
+        Serial.printf("WS [%u] Connected\n", client->id());
+        sendWebSocketData();
+        break;
+      case 1: // WS_DISCONNECTED
+        wsClientConnected = false;
+        Serial.printf("WS [%u] Disconnected\n", client->id());
+        break;
+      case 2: // WS_EVT_DATA (text or binary)
+        if (len > 0 && data) {
+          data[len] = '\0';
+          String msg = (char*)data;
+          StaticJsonDocument<256> doc;
+          if (!deserializeJson(doc, msg)) {
+            const char* cmd = doc["cmd"];
+            if (cmd) {
+              if (strcmp(cmd, "water_start") == 0) controlValve(true, true);
+              else if (strcmp(cmd, "water_stop") == 0) controlValve(false);
+              else if (strcmp(cmd, "sync_rtc") == 0) syncNTP();
+              else if (strcmp(cmd, "get_stats") == 0) sendWebSocketData();
+            }
+          }
+        }
+        break;
+      default:
+        break;
+    }
+  });
+  server.addHandler(&wsServer);
+  Serial.println(F("✅ WebSocket enabled at /ws"));
+}
+
+void sendWebSocketData() {
+  if (!wsClientConnected) return;
+  
+  StaticJsonDocument<1024> doc;
+  doc["ts"] = sensorData.timestamp;
+  doc["soil_moisture"] = sensorData.soilMoistureAvgPct;
+  doc["soil_temp"] = sensorData.soilTempC;
+  doc["ambient_temp"] = sensorData.ambientTempC;
+  doc["humidity"] = sensorData.humidityPct;
+  doc["uv_index"] = sensorData.uvIndex;
+  doc["battery_v"] = sensorData.busVoltageV;
+  doc["current_ma"] = sensorData.currentMA;
+  doc["is_charging"] = sensorData.isCharging;
+  doc["valve_open"] = isWatering;
+  doc["is_raining"] = sensorData.isRaining;
+  doc["ph"] = sensorData.phValue;
+  doc["nitrogen"] = sensorData.nitrogenPpm;
+  doc["phosphorus"] = sensorData.phosphorusPpm;
+  doc["potassium"] = sensorData.potassiumPpm;
+  doc["env_temp"] = sensorData.envTempC;
+  doc["env_hum"] = sensorData.envHumPct;
+  doc["int_temp"] = sensorData.intTempC;
+  doc["int_pres"] = sensorData.intPresHPa;
+  doc["wifi_ip"] = WiFi.localIP().toString();
+  doc["wifi_rssi"] = WiFi.RSSI();
+  
+  String json;
+  serializeJson(doc, json);
+  wsServer.textAll(json);
+}
+
+// ───── History API Handler ───────────────────────────────────────────────────
+void serveHistory(AsyncWebServerRequest* request, const String& sensor) {
+  StaticJsonDocument<2048> doc;
+  JsonArray data = doc.createNestedArray("data");
+
+  File f = LittleFS.open(DB_FILENAME, "r");
+  if (f) {
+    SensorRecord rec;
+    int count = 0;
+    // Read from newest to oldest (reverse order)
+    f.seek(0, SeekEnd);
+    long fileSize = f.size();
+    long pos = fileSize - sizeof(rec);
+    
+    while (pos >= 0 && count < 100) {
+      f.seek(pos);
+      if (f.readBytes((char*)&rec, sizeof(rec)) == sizeof(rec)) {
+        if (rec.magic == 0x47444253) {
+          float val = 0;
+          // Map sensor name to record field
+          if (sensor == "soil_moisture") val = rec.soilMoisture;
+          else if (sensor == "soil1_pct") {
+            int dr = rec.soil1Raw;
+            val = constrain(((3200 - dr) / (3200.0 - 1200.0)) * 100.0, 0, 100);
+          }
+          else if (sensor == "soil2_pct") {
+            int dr = rec.soil2Raw;
+            val = constrain(((3200 - dr) / (3200.0 - 1200.0)) * 100.0, 0, 100);
+          }
+          else if (sensor == "soil3_pct") {
+            int dr = rec.soil3Raw;
+            val = constrain(((3200 - dr) / (3200.0 - 1200.0)) * 100.0, 0, 100);
+          }
+          else if (sensor == "battery_v") val = rec.batteryV;
+          else if (sensor == "current_ma") val = rec.currentMA;
+          else if (sensor == "power_mw") val = rec.powerMW;
+          else if (sensor == "soil_temp") val = rec.soilTemp;
+          else if (sensor == "humidity") val = rec.humidity;
+          else if (sensor == "ambient_temp") val = rec.ambientTemp;
+          else if (sensor == "env_temp") val = rec.envTemp;
+          else if (sensor == "env_hum") val = rec.envHum;
+          else if (sensor == "int_temp") val = rec.intTemp;
+          else if (sensor == "int_pres") val = rec.intPres;
+          else if (sensor == "uv_index") val = rec.uvIndex;
+          else if (sensor == "nitrogen") val = rec.nitrogen;
+          else if (sensor == "phosphorus") val = rec.phosphorus;
+          else if (sensor == "potassium") val = rec.potassium;
+          else if (sensor == "ph") val = rec.ph;
+
+          JsonObject row = data.createNestedObject();
+          row["ts"] = rec.timestamp;
+          row["value"] = round(val * 100.0) / 100.0;
+          
+          // Human-readable label for Chart.js
+          char labelBuf[32];
+          struct tm* ti = localtime((time_t*)&rec.timestamp);
+          strftime(labelBuf, sizeof(labelBuf), "%m/%d %H:%M", ti);
+          row["label"] = String(labelBuf);
+          count++;
+        }
+      }
+      pos -= sizeof(rec);
+    }
+    f.close();
+  }
+
+  String json;
+  serializeJson(doc, json);
+  request->send(200, "application/json", json);
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+//  Local Database (LittleFS-based FIFO)
+// ═════════════════════════════════════════════════════════════════════════════
+bool initDatabase() {
+  // First check if LittleFS is mounted
+  if (!LittleFS.begin(true)) {
+    Serial.println(F("❌ LittleFS mount failed!"));
+    dbInitialized = false;
+    return false;
+  }
+  
+  Serial.printf("✅ LittleFS mounted. Total: %d bytes, Used: %d bytes\n", 
+                LittleFS.totalBytes(), LittleFS.usedBytes());
+  
+  // Check if DB file exists
+  File f = LittleFS.open(DB_FILENAME, "r");
+  if (!f) {
+    Serial.println(F("📝 DB file not found, creating new..."));
+    // Create new DB file with write mode
+    f = LittleFS.open(DB_FILENAME, "w");
+    if (f) {
+      Serial.printf("✅ Database file created: %s\n", DB_FILENAME);
+      f.close();
+      
+      // Verify file was created
+      f = LittleFS.open(DB_FILENAME, "r");
+      if (f) {
+        Serial.printf("✅ Database verified, size: %d bytes\n", f.size());
+        f.close();
+      }
+      dbInitialized = true;
+      return true;
+    }
+    Serial.println(F("❌ Database creation FAILED"));
+    dbInitialized = false;
+    return false;
+  }
+  
+  // File exists, get its size
+  uint32_t fileSize = f.size();
+  uint32_t recordCount = fileSize / sizeof(SensorRecord);
+  f.close();
+  
+  Serial.printf("✅ Database found: %d records (%d bytes)\n", recordCount, fileSize);
+  dbInitialized = true;
+  return true;
+}
+
+bool dbAddRecord() {
+  SensorRecord rec;
+  rec.magic = 0x47444253; // 'GDBS' in little-endian
+  rec.timestamp = sensorData.timestamp;
+  rec.soil1Raw = sensorData.soil1Raw;
+  rec.soil2Raw = sensorData.soil2Raw;
+  rec.soil3Raw = sensorData.soil3Raw;
+  rec.soilMoisture = sensorData.soilMoistureAvgPct;
+  rec.soilTemp = sensorData.soilTempC;
+  rec.ambientTemp = sensorData.ambientTempC;
+  rec.humidity = sensorData.humidityPct;
+  rec.uvIndex = sensorData.uvIndex;
+  rec.batteryV = sensorData.busVoltageV;
+  rec.currentMA = sensorData.currentMA;
+  rec.powerMW = sensorData.powerMW;
+  rec.nitrogen = sensorData.nitrogenPpm;
+  rec.phosphorus = sensorData.phosphorusPpm;
+  rec.potassium = sensorData.potassiumPpm;
+  rec.ph = sensorData.phValue;
+  rec.envTemp = sensorData.envTempC;
+  rec.envHum = sensorData.envHumPct;
+  rec.intTemp = sensorData.intTempC;
+  rec.intPres = sensorData.intPresHPa;
+  rec.isRaining = sensorData.isRaining;
+  rec.valveOpen = isWatering;
+  rec.statusFlags = (sensorData.stat_rtc & 0x03) | ((sensorData.stat_npk & 0x03) << 2) |
+                    ((sensorData.stat_aht & 0x03) << 4) | ((sensorData.stat_ds18 & 0x03) << 6);
+
+  // Use "a+" mode: append + read, creates file if not exists
+  File f = LittleFS.open(DB_FILENAME, "a+");
+  if (!f) {
+    Serial.println(F("⚠️  DB write failed - cannot open"));
+    return false;
+  }
+
+  // Check current record count
+  uint32_t count = f.size() / sizeof(SensorRecord);
+  
+  // FIFO: If at limit, remove oldest record
+  if (count >= DB_MAX_RECORDS) {
+    f.close();
+    dbPruneOldest(DB_MAX_RECORDS - 1); // Keep DB_MAX_RECORDS - 1, then add new
+    f = LittleFS.open(DB_FILENAME, "a+");
+    if (!f) return false;
+    count = f.size() / sizeof(SensorRecord);
+  }
+
+  // Append new record
+  f.seek(0, SeekEnd);
+  size_t written = f.write((const uint8_t*)&rec, sizeof(rec));
+  f.close();
+
+  if (written == sizeof(rec)) {
+    Serial.printf("📝 DB: wrote record %d (size: %d bytes)\n", count + 1, sizeof(rec));
+    return true;
+  } else {
+    Serial.printf("⚠️  DB write incomplete: %d/%d bytes\n", written, sizeof(rec));
+    return false;
+  }
+}
+
+uint32_t dbGetRecordCount() {
+  File f = LittleFS.open(DB_FILENAME, "r");
+  if (!f) return 0;
+  uint32_t count = f.size() / sizeof(SensorRecord);
+  f.close();
+  return count;
+}
+
+void dbPruneOldest(uint32_t keepCount) {
+  File f = LittleFS.open(DB_FILENAME, "r");
+  if (!f) return;
+  
+  // Skip to keepCount records from end
+  uint32_t total = f.size() / sizeof(SensorRecord);
+  uint32_t skipCount = total - keepCount;
+  
+  if (skipCount == 0 || keepCount == 0) {
+    f.close();
+    return;
+  }
+
+  // Read remaining records into memory (max ~760KB for 10000 records)
+  SensorRecord* records = new SensorRecord[keepCount];
+  f.seek(skipCount * sizeof(SensorRecord));
+  size_t read = f.readBytes((char*)records, keepCount * sizeof(SensorRecord));
+  f.close();
+
+  // Write back only kept records
+  f = LittleFS.open(DB_FILENAME, "w");
+  if (f) {
+    f.write((uint8_t*)records, read);
+    f.close();
+  }
+  delete[] records;
+  
+  Serial.printf("📦 DB pruned: removed %d old records\n", skipCount);
+}
+
+void dbClear() {
+  LittleFS.remove(DB_FILENAME);
+  initDatabase();
+  Serial.println(F("📦 Database cleared"));
+}
+
+void dbGetStats(JsonObject &doc) {
+  // Add initialization status
+  doc["db_initialized"] = dbInitialized;
+  
+  // If database not initialized, return minimal safe stats
+  if (!dbInitialized) {
+    doc["record_count"] = 0;
+    doc["max_records"] = DB_MAX_RECORDS;
+    doc["db_size_kb"] = 0;
+    doc["db_max_kb"] = (DB_MAX_RECORDS * sizeof(SensorRecord)) / 1024.0f;
+    doc["days_remaining"] = 0;
+    doc["hours_remaining"] = 0;
+    doc["cycle_interval_ms"] = config.targetCycleIntervalMs;
+    doc["lfs_free_kb"] = 0;
+    doc["heap_free_bytes"] = ESP.getFreeHeap();
+    doc["spiffs_free_kb"] = 0;
+    return;
+  }
+  
+  uint32_t count = dbGetRecordCount();
+  
+  // Calculate storage metrics
+  const size_t RECORD_SIZE = sizeof(SensorRecord);
+  const uint32_t LFS_SIZE = LittleFS.totalBytes();  // ~1MB for Huge APP partition
+  const uint32_t LFS_USED = LittleFS.usedBytes();
+  const uint32_t LFS_FREE = LFS_SIZE > LFS_USED ? LFS_SIZE - LFS_USED : 0;
+  
+  // DB storage calculations
+  const uint32_t dbSizeBytes = count * RECORD_SIZE;
+  const uint32_t dbMaxBytes = DB_MAX_RECORDS * RECORD_SIZE;
+  const uint32_t dbFreeBytes = dbMaxBytes > dbSizeBytes ? dbMaxBytes - dbSizeBytes : 0;
+  
+  // Time calculations based on cycle interval (prevent division by zero)
+  const unsigned long intervalMs = config.targetCycleIntervalMs > 0 ? config.targetCycleIntervalMs : 120000UL;
+  const float recordsPerHour = 3600000.0f / intervalMs;
+  const float recordsPerDay = recordsPerHour * 24.0f;
+  
+  // Days remaining calculations (prevent NaN)
+  const uint32_t recordsRemaining = DB_MAX_RECORDS > count ? DB_MAX_RECORDS - count : 0;
+  const float daysRemaining = (recordsPerDay > 0 && recordsRemaining > 0) ? (recordsRemaining / recordsPerDay) : 0.0f;
+  const float hoursRemaining = (recordsPerHour > 0 && recordsRemaining > 0) ? (recordsRemaining / recordsPerHour) : 0.0f;
+  
+  // Calculate actual storage percentage used in LittleFS
+  const float lfsUsagePct = (LFS_SIZE > 0) ? ((float)LFS_USED / LFS_SIZE) * 100.0f : 0.0f;
+  
+  // Calculate what DB percentage is of max allowed
+  const float dbFillPct = (float)count / (float)DB_MAX_RECORDS * 100.0f;
+
+  doc["record_count"] = count;
+  doc["max_records"] = DB_MAX_RECORDS;
+  doc["record_size_bytes"] = RECORD_SIZE;
+  
+  // Storage in bytes
+  doc["db_size_bytes"] = dbSizeBytes;
+  doc["db_max_bytes"] = dbMaxBytes;
+  doc["db_free_bytes"] = dbFreeBytes;
+  
+  // LittleFS storage
+  doc["lfs_total_bytes"] = LFS_SIZE;
+  doc["lfs_used_bytes"] = LFS_USED;
+  doc["lfs_free_bytes"] = LFS_FREE;
+  doc["lfs_usage_percent"] = lfsUsagePct;
+  
+  // Human readable storage
+  doc["db_size_kb"] = dbSizeBytes / 1024.0f;
+  doc["db_max_kb"] = dbMaxBytes / 1024.0f;
+  doc["db_free_kb"] = dbFreeBytes / 1024.0f;
+  doc["lfs_free_kb"] = LFS_FREE / 1024.0f;
+  
+  // Time metrics
+  doc["cycle_interval_ms"] = intervalMs;
+  doc["records_per_hour"] = recordsPerHour;
+  doc["records_per_day"] = recordsPerDay;
+  doc["records_remaining"] = recordsRemaining;
+  
+  // Duration estimates
+  doc["days_remaining"] = daysRemaining;
+  doc["hours_remaining"] = hoursRemaining;
+  doc["weeks_remaining"] = daysRemaining / 7.0f;
+  
+  // Alias for backward compatibility with frontend
+  doc["spiffs_free_kb"] = doc["lfs_free_kb"];
+  
+  // Fill percentages
+  doc["db_fill_percent"] = dbFillPct;
+  doc["fifo_mode"] = true;
+  
+  // Flash memory info
+  doc["flash_size_bytes"] = ESP.getFlashChipSize();
+  doc["flash_free_sketch"] = ESP.getFreeSketchSpace();
+  doc["heap_free_bytes"] = ESP.getFreeHeap();
+  doc["heap_min_free"] = ESP.getMinFreeHeap();
+  
+  // Dynamic interval info
+  doc["is_auto_interval"] = config.isAutoInterval;
+  if (config.isAutoInterval) {
+    doc["interval_mode"] = "auto";
+    doc["battery_adjusted"] = (sensorData.busVoltageV > 1.0f && sensorData.busVoltageV < 3.7f);
+  } else {
+    doc["interval_mode"] = "fixed";
+    doc["interval_seconds"] = intervalMs / 1000;
+  }
+  
+  // Estimate when database will be full
+  if (count > 0 && intervalMs > 0) {
+    unsigned long msSinceOldest = 0;
+    File f = LittleFS.open(DB_FILENAME, "r");
+    if (f && f.available()) {
+      SensorRecord rec;
+      if (f.readBytes((char*)&rec, sizeof(rec)) == sizeof(rec)) {
+        if (rec.magic == 0x47444253) {
+          msSinceOldest = (sensorData.timestamp - rec.timestamp) * 1000;
+        }
+      }
+      f.close();
+    }
+    
+    if (msSinceOldest > 0 && recordsRemaining > 0) {
+      float msPerRecord = (float)msSinceOldest / (float)count;
+      unsigned long estMsToFull = (unsigned long)((float)recordsRemaining * msPerRecord);
+      doc["estimated_hours_to_full"] = estMsToFull / 3600000.0f;
+      doc["estimated_full_date"] = (sensorData.timestamp + (estMsToFull / 1000));
+    }
+  }
+}
+
+void dbSyncToCloud() {
+  if (!mqttClient.connected()) return;
+  
+  File f = LittleFS.open(DB_FILENAME, "r");
+  if (!f) return;
+
+  StaticJsonDocument<1024> doc;
+  SensorRecord rec;
+  uint32_t syncedCount = 0;
+  uint32_t startPos = preferences.getULong("db_sync_pos", 0);
+  
+  f.seek(startPos);
+  
+  while (f.available() && syncedCount < 10) { // Sync max 10 records per call
+    if (f.readBytes((char*)&rec, sizeof(rec)) == sizeof(rec)) {
+      if (rec.magic == 0x47444253) {
+        // Build JSON payload
+        doc.clear();
+        doc["ts"] = rec.timestamp;
+        doc["soil_moisture"] = rec.soilMoisture;
+        doc["soil_temp"] = rec.soilTemp;
+        doc["ambient_temp"] = rec.ambientTemp;
+        doc["humidity"] = rec.humidity;
+        doc["uv_index"] = rec.uvIndex;
+        doc["battery_v"] = rec.batteryV;
+        doc["current_ma"] = rec.currentMA;
+        doc["power_mw"] = rec.powerMW;
+        doc["nitrogen"] = rec.nitrogen;
+        doc["phosphorus"] = rec.phosphorus;
+        doc["potassium"] = rec.potassium;
+        doc["ph"] = rec.ph;
+        doc["env_temp"] = rec.envTemp;
+        doc["env_hum"] = rec.envHum;
+        doc["int_temp"] = rec.intTemp;
+        doc["int_pres"] = rec.intPres;
+        doc["is_raining"] = rec.isRaining;
+        doc["valve_open"] = rec.valveOpen;
+
+        String payload;
+        serializeJson(doc, payload);
+        mqttClient.publish(MQTT_TOPIC_PUB, payload.c_str());
+        syncedCount++;
+      }
+    }
+  }
+  
+  // Save sync position
+  uint32_t newPos = f.position();
+  preferences.putULong("db_sync_pos", newPos);
+  f.close();
+  
+  if (syncedCount > 0) {
+    Serial.printf("📤 Synced %d records to cloud\n", syncedCount);
+    
+    // If we've synced all records, reset position for next cycle
+    if (newPos >= (dbGetRecordCount() * sizeof(SensorRecord))) {
+      preferences.putULong("db_sync_pos", 0);
+    }
+  }
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+//  Sensors
+// ═════════════════════════════════════════════════════════════════════════════
+void resetI2CBus() {
+  pinMode(21, OUTPUT);
+  pinMode(22, OUTPUT);
+  for (int i = 0; i < 9; i++) {
+    digitalWrite(22, HIGH);
+    delayMicroseconds(5);
+    digitalWrite(22, LOW);
+    delayMicroseconds(5);
+  }
+  pinMode(21, INPUT);
+  pinMode(22, INPUT);
+}
+
+void initSensors() {
+  resetI2CBus();
+  Wire.begin();
+
+  // AHT10
+  if (!aht10.begin()) {
+    Serial.println(F("⚠️  AHT10 not found"));
+    sensorData.stat_aht = 2;
+  } else sensorData.stat_aht = 0;
+
+  // BMP280
+  if (!bmp280.begin(0x76) && !bmp280.begin(0x77)) {
+    Serial.println(F("⚠️  BMP280 not found"));
+    sensorData.stat_bmp = 2;
+  } else {
+    sensorData.stat_bmp = 0;
+    bmp280.setSampling(Adafruit_BMP280::MODE_NORMAL, Adafruit_BMP280::SAMPLING_X2, Adafruit_BMP280::SAMPLING_X16, Adafruit_BMP280::FILTER_X16, Adafruit_BMP280::STANDBY_MS_500);
+  }
+
+  // HDC1080
+  hdc1080.begin(0x40);
+  sensorData.stat_hdc = 0;
+
+  // DS18B20
+  ds18b20.begin();
+  if (ds18b20.getDeviceCount() > 0) sensorData.stat_ds18 = 0;
+  else sensorData.stat_ds18 = 2;
+
+  // INA226
+  if (!ina226.begin()) {
+    Serial.println(F("⚠️  INA226 not found"));
+    sensorData.stat_ina = 2;
+  } else {
+    ina226.configure(INA226_SHUNT_OHM, INA226_Current_LSB_mA, INA226_Current_Zero_Offset, INA226_Bus_V_scaling);
+    ina226.setAverage(2);
+    sensorData.stat_ina = 0;
+  }
+}
+
 void readSensors() {
   if (sensorData.stat_rtc != 2) {
     DateTime now = rtc.now();
-    // now.unixtime() assumes the DateTime is UTC. Since we stored local time, we must subtract the offset.
     sensorData.timestamp = now.unixtime() - GMT_OFFSET_SEC;
   } else {
     struct tm timeinfo;
     if (getLocalTime(&timeinfo, 10)) {
       sensorData.timestamp = mktime(&timeinfo);
     } else {
-      sensorData.timestamp = millis() / 1000;  // ultimate fallback
+      sensorData.timestamp = millis() / 1000;
     }
   }
 
-  // ── Soil Moisture (ADC1, averaged 5 samples each) ──
   auto readADC = [](int pin, int n = 5) -> int {
     long sum = 0;
     for (int i = 0; i < n; i++) {
@@ -638,36 +1382,19 @@ void readSensors() {
   float m3 = rawToMoisturePct(sensorData.soil3Raw);
 
   float m[3] = { m1, m2, m3 };
-  // Sort values
-  if (m[0] > m[1]) {
-    float t = m[0];
-    m[0] = m[1];
-    m[1] = t;
-  }
-  if (m[1] > m[2]) {
-    float t = m[1];
-    m[1] = m[2];
-    m[2] = t;
-  }
-  if (m[0] > m[1]) {
-    float t = m[0];
-    m[0] = m[1];
-    m[1] = t;
-  }
+  if (m[0] > m[1]) { float t = m[0]; m[0] = m[1]; m[1] = t; }
+  if (m[1] > m[2]) { float t = m[1]; m[1] = m[2]; m[2] = t; }
+  if (m[0] > m[1]) { float t = m[0]; m[0] = m[1]; m[1] = t; }
 
   float avg = 0;
-  if ((m[2] - m[1]) > 15.0f) {
-    avg = (m[0] + m[1]) / 2.0f;  // Exclude high outlier
-  } else if ((m[1] - m[0]) > 15.0f) {
-    avg = (m[1] + m[2]) / 2.0f;  // Exclude low outlier
-  } else {
-    avg = (m[0] + m[1] + m[2]) / 3.0f;
-  }
+  if ((m[2] - m[1]) > 15.0f) avg = (m[0] + m[1]) / 2.0f;
+  else if ((m[1] - m[0]) > 15.0f) avg = (m[1] + m[2]) / 2.0f;
+  else avg = (m[0] + m[1] + m[2]) / 3.0f;
 
   acc.soilMoistureAvgPct += avg;
   acc.c_soilMoisture++;
 
-  // ── DS18B20 Soil Temperature ──
+  // DS18B20
   if (sensorData.stat_ds18 != 2) {
     ds18b20.requestTemperatures();
     float val = ds18b20.getTempCByIndex(0);
@@ -679,82 +1406,63 @@ void readSensors() {
     }
   }
 
-  // ── AHT10 Ambient Temp + Humidity ──
+  // AHT10
   if (sensorData.stat_aht != 2) {
     sensors_event_t hum, temp;
     if (aht10.getEvent(&hum, &temp)) {
-      float aTemp = (temp.temperature * MULT_AHT_TEMP) + OFFSET_AHT_TEMP;
-      float aHum = (hum.relative_humidity * MULT_AHT_HUMIDITY) + OFFSET_AHT_HUMIDITY;
-      acc.ambientTempC += aTemp;
+      acc.ambientTempC += (temp.temperature * MULT_AHT_TEMP) + OFFSET_AHT_TEMP;
       acc.c_ambientTemp++;
-      acc.humidityPct += aHum;
+      acc.humidityPct += (hum.relative_humidity * MULT_AHT_HUMIDITY) + OFFSET_AHT_HUMIDITY;
       acc.c_humidity++;
-    } else {
-      sensorData.stat_aht = 2;
-    }
+    } else sensorData.stat_aht = 2;
   }
 
-  // ── HDC1080 Environment 1 ──
+  // HDC1080
   float hdcT = (hdc1080.readTemperature() * MULT_HDC_TEMP) + OFFSET_HDC_TEMP;
   float hdcH = (hdc1080.readHumidity() * MULT_HDC_HUM) + OFFSET_HDC_HUM;
-  if (hdcT < 120.0f) {  // Arbitrary validity check
+  if (hdcT < 120.0f) {
     acc.envTempC += hdcT;
     acc.c_envTemp++;
     acc.envHumPct += hdcH;
     acc.c_envHum++;
     sensorData.stat_hdc = 0;
-  } else {
-    sensorData.stat_hdc = 2;
-  }
+  } else sensorData.stat_hdc = 2;
 
-  // ── BMP280 Internal Enclosure ──
+  // BMP280
   if (sensorData.stat_bmp != 2) {
-    float bmpT = (bmp280.readTemperature() * MULT_BMP_TEMP) + OFFSET_BMP_TEMP;
-    float bmpP = (bmp280.readPressure() / 100.0F * MULT_BMP_PRES) + OFFSET_BMP_PRES;
-    acc.intTempC += bmpT;
+    acc.intTempC += (bmp280.readTemperature() * MULT_BMP_TEMP) + OFFSET_BMP_TEMP;
     acc.c_intTemp++;
-    acc.intPresHPa += bmpP;
+    acc.intPresHPa += (bmp280.readPressure() / 100.0F * MULT_BMP_PRES) + OFFSET_BMP_PRES;
     acc.c_intPres++;
   }
 
-  // ── ESP32 SoC Temperature ──
-  float socT = (temperatureRead() * MULT_SOC_TEMP) + OFFSET_SOC_TEMP;
-  acc.socTempC += socT;
+  // SoC Temp
+  acc.socTempC += (temperatureRead() * MULT_SOC_TEMP) + OFFSET_SOC_TEMP;
   acc.c_socTemp++;
 
-  // ── UV Index (GUVA-S12SD) ──
-  int uvRaw = readADC(PIN_UV);
-  float uvI = (rawToUVIndex(uvRaw) * MULT_UV) + OFFSET_UV;
-  acc.uvIndex += uvI;
+  // UV
+  acc.uvIndex += rawToUVIndex(readADC(PIN_UV));
   acc.c_uv++;
 
-  // ── Raindrop (PHYSICAL MODULE REMOVED) ──
-  // Now using BMP280, AHT10, HDC1080 and UV for detection
-  // This is handled at the end of readSensors()
-  sensorData.rainRaw = 0;
-
-  // ── INA226 Power Monitor ──
+  // INA226
   if (sensorData.stat_ina != 2) {
     float busV = ina226.getBusVoltage() + INA226_V_OFFSET_v;
     float shuntMV = ina226.getShuntVoltage_mV();
     float currMA = ina226.getCurrent_mA() + INA226_I_OFFSET_mA;
-    float powMW = (busV - shuntMV / 1000) * currMA;  // P(mW) = V(V) * I(mA)
+    float powMW = (busV - shuntMV / 1000) * currMA;
     acc.busVoltageV += busV;
     acc.c_busVoltage++;
     acc.currentMA += currMA;
     acc.c_current++;
     acc.powerMW += powMW;
     acc.c_power++;
-    // Keep live values for auto-watering/charging detection
     sensorData.busVoltageV = busV;
     sensorData.currentMA = currMA;
-    sensorData.isCharging = (currMA > 0);  // positive = charger pushing current in
+    sensorData.isCharging = (currMA > 0);
   }
 
-  // ── Fallback Rain Detection (Offline) ──
-  sensorData.isRaining = false;  // Reset each cycle so it doesn't get stuck
-
-  // Update pressure history every 15 minutes
+  // Rain detection
+  sensorData.isRaining = false;
   unsigned long nowMs = millis();
   if (sensorData.stat_bmp != 2 && (nowMs - sensorData.lastPresHistoryUpdate >= 900000UL || sensorData.lastPresHistoryUpdate == 0)) {
     sensorData.lastPresHistoryUpdate = nowMs;
@@ -764,26 +1472,20 @@ void readSensors() {
     if (sensorData.presIdx == 0) sensorData.presHistReady = true;
 
     if (sensorData.presHistReady) {
-      // Calculate drop over 3 hours
       float oldPres = sensorData.presHistory[sensorData.presIdx];
       float drop = oldPres - currentPres;
-
       if (drop > 3.0) sensorData.isRaining = true;
-      Serial.printf("📊 Pressure Trend: %.2f hPa drop over 3h\n", drop);
     }
   }
 
-  // High Humidity Fallback
   float curHum = acc.humidityPct / (acc.c_humidity > 0 ? acc.c_humidity : 1);
   if (curHum > 96.0f) sensorData.isRaining = true;
 
-  // Daylight Smart Detection (Solar + UV)
   bool isDay = true;
   if (sensorData.stat_rtc != 2) {
     DateTime now = rtc.now();
     if (now.hour() < 7 || now.hour() > 17) isDay = false;
   }
-
   if (isDay) {
     float curUV = acc.uvIndex / (acc.c_uv > 0 ? acc.c_uv : 1);
     if (curUV < 0.5f && curHum > 85.0f && sensorData.currentMA < 10.0f) {
@@ -791,38 +1493,14 @@ void readSensors() {
     }
   }
 
-  // Use Remote Prediction if it's fresh (last 15 mins)
   if (nowMs - sensorData.lastRemoteRainMs < 900000UL) {
     sensorData.isRaining = sensorData.remoteRainPredicted;
   }
 
-  // Read NPK and PH automatically every cycle
   readNPKandPH();
 }
 
-// ── Capacitive moisture: higher raw = drier ──
-float rawToMoisturePct(int raw) {
-  // Calibrate: dry≈3200 (0%), wet≈1200 (100%)
-  const int DRY_VAL = 3200;
-  const int WET_VAL = 1200;
-  float pct = ((float)(DRY_VAL - raw) / (float)(DRY_VAL - WET_VAL)) * 100.0f;
-  return constrain(pct, 0.0f, 100.0f);
-}
-
-// ── GUVA-S12SD UV Index ──
-float rawToUVIndex(int raw) {
-  // Vout = raw * 3.3 / 4095, UV index ≈ Vout / 0.1 (approx formula)
-  float voltage = (float)raw * 3.3f / 4095.0f;
-  float uvIndex = voltage / 0.1f;  // rough approximation
-  return constrain(uvIndex, 0.0f, 16.0f);
-}
-
-// =============================================================================
-//  NPK (RS485 Modbus RTU)
-// =============================================================================
 void readNPKandPH() {
-  // Some NPK sensors strictly reject multi-register reads (Count=0x03).
-  // We will read them sequentially just like the debug script!
   auto readNPKReg = [](uint8_t* query) -> int {
     while (rs485Serial.available()) rs485Serial.read();
     digitalWrite(PIN_RS485_DE_RE, HIGH);
@@ -836,14 +1514,13 @@ void readNPKandPH() {
     int len = 0;
     unsigned long t = millis();
     while (millis() - t < 300) {
-      yield(); // Crucial to prevent ESP32 WDT reset!
+      yield();
       while (rs485Serial.available()) {
         if (len < 20) buf[len++] = rs485Serial.read();
         else rs485Serial.read();
       }
     }
 
-    // Scan dynamically for Modbus frame start (ignoring leading noise)
     for (int i = 0; i < len - 2; i++) {
       if (buf[i] == 0x01 && buf[i + 1] == 0x03 && buf[i + 2] == 0x02) {
         if (i + 4 < len) return (buf[i + 3] << 8) | buf[i + 4];
@@ -852,7 +1529,6 @@ void readNPKandPH() {
     return -1;
   };
 
-  // Pre-calculated CRCs for registers 0x001E, 0x001F, 0x0020 (Length=1)
   uint8_t qN[] = { 0x01, 0x03, 0x00, 0x1E, 0x00, 0x01, 0xE4, 0x0C };
   uint8_t qP[] = { 0x01, 0x03, 0x00, 0x1F, 0x00, 0x01, 0xB5, 0xCC };
   uint8_t qK[] = { 0x01, 0x03, 0x00, 0x20, 0x00, 0x01, 0x85, 0xC0 };
@@ -864,39 +1540,47 @@ void readNPKandPH() {
   int k = readNPKReg(qK);
 
   if (n != -1 && p != -1 && k != -1) {
-    acc.nitrogenPpm += (n * MULT_N) + OFFSET_N;
+    acc.nitrogenPpm += n;
     acc.c_nitrogen++;
-    acc.phosphorusPpm += (p * MULT_P) + OFFSET_P;
+    acc.phosphorusPpm += p;
     acc.c_phosphorus++;
-    acc.potassiumPpm += (k * MULT_K) + OFFSET_K;
+    acc.potassiumPpm += k;
     acc.c_potassium++;
     sensorData.npkValid = true;
     sensorData.stat_npk = 0;
   } else {
     sensorData.npkValid = false;
     sensorData.stat_npk = 2;
-    Serial.println(F("⚠️  NPK RS485 read failed"));
   }
 
-  // PH Sensor via direct ADC (Pin 36)
+  // PH
   long phSum = 0;
   for (int i = 0; i < 10; i++) {
     phSum += analogRead(PIN_PH);
     delay(5);
   }
   int phRaw12Bit = phSum / 10;
-  float sensorValue10Bit = (float)phRaw12Bit * 0.16489f;
   float actualVoltage = (float)phRaw12Bit * 3.3f / 4095.0f;
   float phV = (-24.36 * actualVoltage) + 22.34;
-  phV = (phV * MULT_PH) + OFFSET_PH;
-
   acc.phValue += phV;
   acc.c_ph++;
 }
 
-// =============================================================================
-//  Auto Watering Logic
-// =============================================================================
+float rawToMoisturePct(int raw) {
+  const int DRY_VAL = 3200;
+  const int WET_VAL = 1200;
+  float pct = ((float)(DRY_VAL - raw) / (float)(DRY_VAL - WET_VAL)) * 100.0f;
+  return constrain(pct, 0.0f, 100.0f);
+}
+
+float rawToUVIndex(int raw) {
+  float voltage = (float)raw * 3.3f / 4095.0f;
+  return constrain(voltage / 0.1f, 0.0f, 16.0f);
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+//  Auto Watering
+// ═════════════════════════════════════════════════════════════════════════════
 void checkAutoWatering() {
   bool tooDry = (sensorData.soilMoistureAvgPct < 50.0f);
 
@@ -930,20 +1614,26 @@ void controlValve(bool open, bool isManual) {
 
     char logBuffer[256];
     serializeJson(logDoc, logBuffer);
-    mqttClient.publish(MQTT_TOPIC_PUB, logBuffer);
+    if (mqttClient.connected()) {
+      mqttClient.publish(MQTT_TOPIC_PUB, logBuffer);
+    }
   }
 
   digitalWrite(PIN_MOSFET_VALVE, open ? HIGH : LOW);
   Serial.printf("💧 Valve: %s\n", open ? "OPEN" : "CLOSED");
+  
+  // Broadcast via WebSocket
+  sendWebSocketData();
 }
 
-// =============================================================================
-//  MQTT Publish & Process
-// =============================================================================
+// ═════════════════════════════════════════════════════════════════════════════
+//  Process & Publish
+// ═════════════════════════════════════════════════════════════════════════════
 void processAndPublishData() {
   auto avg = [](float sum, int count) -> float {
     return count > 0 ? sum / count : 0.0f;
   };
+  
   sensorData.soilMoistureAvgPct = avg(acc.soilMoistureAvgPct, acc.c_soilMoisture);
   sensorData.soilTempC = avg(acc.soilTempC, acc.c_soilTemp);
   sensorData.ambientTempC = avg(acc.ambientTempC, acc.c_ambientTemp);
@@ -964,14 +1654,15 @@ void processAndPublishData() {
 
   acc.reset();
 
-  if (!mqttClient.connected()) {
-    connectMQTT();
-    if (!mqttClient.connected()) return;
+  // Publish via MQTT if connected
+  if (mqttClient.connected()) {
+    String payload = buildJsonPayload();
+    mqttClient.publish(MQTT_TOPIC_PUB, payload.c_str(), false);
+    Serial.printf("📤 Published %d bytes to MQTT\n", payload.length());
   }
 
-  String payload = buildJsonPayload();
-  mqttClient.publish(MQTT_TOPIC_PUB, payload.c_str(), false);
-  Serial.printf("📤 Published %d bytes to %s\n", payload.length(), MQTT_TOPIC_PUB);
+  // Also broadcast via WebSocket for local clients
+  sendWebSocketData();
   
   printSensorReadings();
 }
@@ -984,9 +1675,9 @@ void logSystemEvents() {
   JsonArray events = doc.createNestedArray("events");
   
   if (sensorData.busVoltageV <= 2.85f && sensorData.busVoltageV > 1.0f && sensorData.stat_ina != 2) {
-      events.add("Low Battery Warning: " + String(sensorData.busVoltageV, 1) + "V");
+    events.add("Low Battery: " + String(sensorData.busVoltageV, 1) + "V");
   } else if (sensorData.busVoltageV >= 4.15f && sensorData.stat_ina != 2) {
-      events.add("Battery Full: " + String(sensorData.busVoltageV, 1) + "V");
+    events.add("Battery Full: " + String(sensorData.busVoltageV, 1) + "V");
   }
   
   if (sensorData.stat_rtc == 2) events.add("RTC Error");
@@ -997,43 +1688,26 @@ void logSystemEvents() {
   if (sensorData.stat_npk == 2) events.add("NPK Sensor Error");
   
   if (events.size() > 0) {
-      char buffer[512];
-      serializeJson(doc, buffer);
+    char buffer[512];
+    serializeJson(doc, buffer);
+    if (mqttClient.connected()) {
       mqttClient.publish(MQTT_TOPIC_PUB, buffer);
-      Serial.println(F("⚠️  Published system events"));
+    }
   }
 }
 
 void printSensorReadings() {
   Serial.println();
-  Serial.println(F("--- Sensor Readings (Calibrated 1-min Avg) ---"));
-  Serial.printf("  Soil Moisture    : %.1f %%\n", sensorData.soilMoistureAvgPct);
-  Serial.printf("  Soil Temp        : %.1f C\n", sensorData.soilTempC);
-  if (sensorData.stat_aht != 2) {
-    Serial.printf("  Env2 Temp (AHT)  : %.1f C\n", sensorData.ambientTempC);
-    Serial.printf("  Env2 Hum  (AHT)  : %.1f %%\n", sensorData.humidityPct);
-  } else Serial.println(F("  Env2 (AHT10)     : [ERROR]"));
-  if (sensorData.stat_hdc != 2) {
-    Serial.printf("  Env1 Temp (HDC)  : %.1f C\n", sensorData.envTempC);
-    Serial.printf("  Env1 Hum  (HDC)  : %.1f %%\n", sensorData.envHumPct);
-  } else Serial.println(F("  Env1 (HDC1080)   : [ERROR]"));
-  if (sensorData.stat_bmp != 2) {
-    Serial.printf("  Enclosure Temp   : %.1f C\n", sensorData.intTempC);
-    Serial.printf("  Enclosure Pres   : %.1f hPa\n", sensorData.intPresHPa);
-  } else Serial.println(F("  Enclosure (BMP)  : [ERROR]"));
-  Serial.printf("  SoC Temp         : %.1f C\n", sensorData.socTempC);
-  Serial.printf("  UV Index         : %.1f\n", sensorData.uvIndex);
-  Serial.printf("  Rain Raw         : %d (%s)\n", sensorData.rainRaw, sensorData.isRaining ? "RAIN" : "DRY");
-  Serial.printf("  Bus Voltage      : %.2f V\n", sensorData.busVoltageV);
-  Serial.printf("  Current          : %.1f mA\n", sensorData.currentMA);
-  Serial.printf("  Power            : %.1f mW\n", sensorData.powerMW);
-  if (sensorData.npkValid) {
-    Serial.printf("  Nitrogen  (N)    : %.1f ppm\n", sensorData.nitrogenPpm);
-    Serial.printf("  Phosphorus(P)    : %.1f ppm\n", sensorData.phosphorusPpm);
-    Serial.printf("  Potassium (K)    : %.1f ppm\n", sensorData.potassiumPpm);
-  } else Serial.println(F("  NPK              : [NO DATA]"));
-  Serial.printf("  PH               : %.2f\n", sensorData.phValue);
-  Serial.println(F("----------------------------------------------"));
+  Serial.println(F("--- Sensor Readings ---"));
+  Serial.printf("  Soil Moisture: %.1f %%\n", sensorData.soilMoistureAvgPct);
+  Serial.printf("  Soil Temp   : %.1f C\n", sensorData.soilTempC);
+  Serial.printf("  Ambient     : %.1f C / %.1f %%\n", sensorData.ambientTempC, sensorData.humidityPct);
+  Serial.printf("  UV Index    : %.1f\n", sensorData.uvIndex);
+  Serial.printf("  Battery     : %.2f V (%.1f mA)\n", sensorData.busVoltageV, sensorData.currentMA);
+  Serial.printf("  NPK         : N=%.0f P=%.0f K=%.0f\n", sensorData.nitrogenPpm, sensorData.phosphorusPpm, sensorData.potassiumPpm);
+  Serial.printf("  pH          : %.2f\n", sensorData.phValue);
+  Serial.printf("  DB Records  : %d\n", dbGetRecordCount());
+  Serial.println(F("------------------------"));
 }
 
 String buildJsonPayload() {
@@ -1049,9 +1723,7 @@ String buildJsonPayload() {
     doc["ambient_temp"] = round(sensorData.ambientTempC * 10) / 10.0;
     doc["humidity"] = round(sensorData.humidityPct * 10) / 10.0;
   }
-
   doc["uv_index"] = round(sensorData.uvIndex * 10) / 10.0;
-  doc["rain_raw"] = sensorData.rainRaw;
   doc["is_raining"] = sensorData.isRaining;
   doc["battery_v"] = round(sensorData.busVoltageV * 100) / 100.0;
   doc["current_ma"] = round(sensorData.currentMA * 10) / 10.0;
@@ -1071,7 +1743,6 @@ String buildJsonPayload() {
     doc["int_pres"] = round(sensorData.intPresHPa * 10) / 10.0;
   }
   doc["soc_temp"] = round(sensorData.socTempC * 10) / 10.0;
-
   doc["ph"] = round(sensorData.phValue * 100) / 100.0;
 
   if (sensorData.npkValid) {
@@ -1091,10 +1762,12 @@ String buildJsonPayload() {
   sys["bmp"] = sStr(sensorData.stat_bmp);
   sys["hdc"] = sStr(sensorData.stat_hdc);
   sys["ina"] = sStr(sensorData.stat_ina);
+  
   char timeStr[32];
   struct tm* ti = localtime(&sensorData.timestamp);
   strftime(timeStr, sizeof(timeStr), "%Y-%m-%d %H:%M:%S", ti);
   sys["rtc_time"] = timeStr;
+  sys["db_records"] = dbGetRecordCount();
 
   String out;
   serializeJson(doc, out);
